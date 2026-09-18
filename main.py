@@ -68,36 +68,63 @@ class Main(Star):
             "🎮 【HLTV 赛事助手指令菜单】\n"
             "------------------------------------\n"
             "• /hltv today (或 /hltv 赛程)：查看今日大型赛事（当日打完自动切换明日预告）\n"
-            "• /hltv results (或 /hltv 战报)：查看当天大型赛事完赛战报（按比赛日时区）\n"
-            "• /hltv match <ID/战队> [图号]：查看比赛全员KDA/Rating及单图详细数据\n"
-            "• /hltv live (或 /hltv 正在进行)：查看当前正在进行的比赛\n"
+            "• /hltv results (或 /hltv 战报)：查看当天大型赛事完赛战报（按当地比赛日时区）\n"
+            "• /hltv match <ID/战队> [图号]：查看比赛全员KDA/Rating及单图详细数据（支持绿龙、小蜜蜂等中文别名）\n"
+            "• /hltv live (或 /hltv 正在进行)：查看当前正在进行的比赛及比分\n"
+            "• /hltv refresh (或 /hltv 刷新)：强制刷新上游缓存，获取最新完赛比分与数据\n"
             "• /hltv sub (或 /hltv 订阅)：订阅当前聊天的赛前提醒与每日赛程\n"
             "• /hltv unsub (或 /hltv 取消订阅)：取消当前聊天订阅\n"
             "• /hltv status (或 /hltv 状态)：查看插件运行配置、比赛日时区与赛事级别说明\n"
             "------------------------------------\n"
-            "💡 比赛日规则：按各赛事当地时区动态智能划分（欧洲/美洲/亚洲等），确保北京时间深夜场与次日凌晨场次归属同一比赛日；自动过滤无名低级小比赛，仅追踪世界Top 30与精英赛事。"
+            "💡 战队别名示例：支持绿龙(Spirit)、小蜜蜂(Vitality)、银河战舰/大表哥(FaZe)、老鼠(MOUZ)、A队(Astralis)、蒙古(The MongolZ)、天禄(TYLOO)等。"
         )
         yield event.plain_result(help_text)
 
+    @hltv.command("refresh", alias={"刷新", "清除缓存"})
+    async def hltv_refresh(self, event: AstrMessageEvent):
+        """清除上游服务端缓存，强制获取最新实时赛程与比分"""
+        ok = await self.client.clear_cache()
+        if ok:
+            yield event.plain_result("🔄 已成功向 HLTV 接口服务发送刷新指令并清除服务端缓存，已拉取最新实时数据！")
+        else:
+            yield event.plain_result("⚠️ 发送刷新指令失败，请稍后重试。")
+
     @hltv.command("match", alias={"比赛", "数据", "战报详情", "比赛详情"})
     async def hltv_match(self, event: AstrMessageEvent, query: str = "", map_arg: str = ""):
-        """查看指定比赛的全员KDA、Rating及单图详细数据。用法: /hltv match <比赛ID或战队名称> [图号]"""
+        """查看指定比赛的全员KDA、Rating及单图详细数据。用法: /hltv match <比赛ID或战队名称/别名> [图号]"""
         clean_q = query.strip()
         if not clean_q:
             yield event.plain_result(
-                "ℹ️ 请提供要查询的比赛ID或战队名称。\n"
+                "ℹ️ 请提供要查询的比赛ID或战队名称（支持中文别名，如 绿龙、小蜜蜂、银河战舰、老鼠 等）。\n"
                 "💡 格式：/hltv match <比赛ID或战队名> [图号]\n"
                 "例如：\n"
                 "  • /hltv match 2398026 （查看全场全员KDA、Rating）\n"
                 "  • /hltv match 2398026 1 （查看图1单图选手数据）\n"
-                "  • /hltv match Spirit （按战队名查询比赛）\n"
+                "  • /hltv match 绿龙 （支持战队中文别名查询）\n"
+                "  • /hltv match 2398026 -r （带 -r 强制刷新上游缓存）\n"
                 "提示：发送 /hltv live、/hltv results 或 /hltv today 可获取比赛ID。"
             )
             return
 
-        detail = await self.client.find_match(clean_q)
+        # 检测是否携带强制刷新标记（如 /hltv match 2398026 -r 或 /hltv match 绿龙 刷新）
+        force_refresh = False
+        for flag in ("-r", "--refresh", "刷新", "-f"):
+            if clean_q.endswith(f" {flag}"):
+                force_refresh = True
+                clean_q = clean_q[:-len(flag)].strip()
+                break
+            elif clean_q == flag:
+                force_refresh = True
+                clean_q = ""
+                break
+
+        if not clean_q:
+            clean_q = map_arg.strip()
+            map_arg = ""
+
+        detail = await self.client.find_match(clean_q, force_refresh=force_refresh)
         if not detail:
-            yield event.plain_result(f"❌ 未找到与「{clean_q}」相关的比赛数据。\n提示：可使用数字比赛ID或更精确的战队名重新查询。")
+            yield event.plain_result(f"❌ 未找到与「{clean_q}」相关的比赛数据。\n提示：可使用数字比赛ID或战队名（如 绿龙/Spirit）重新查询。")
             return
 
         # 若 find_match 仅返回简略信息，且有 id，尝试获取全量 detail

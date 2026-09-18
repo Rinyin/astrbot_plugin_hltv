@@ -629,8 +629,16 @@ class HLTVScheduler:
                     lines.append(self.format_player_row(p))
             lines.append("------------------------")
         else:
-            lines.append("⚠️ 暂无选手数据（比赛可能尚未开赛或正在进行中）")
+            if status == "finished":
+                lines.append("ℹ️ 该比赛已完赛，大比分已确认。选手详细 KDA/Rating 正在同步中。")
+            else:
+                lines.append("⚠️ 暂无选手数据（比赛可能尚未开赛或正在进行中）")
             lines.append("------------------------")
+
+        if detail.get("is_synced_from_results"):
+            lines.append("💡 提示：检测到上游比赛详情包含陈旧缓存，已自动结合最新赛果库对齐最终比分。")
+        elif detail.get("is_fallback_from_list"):
+            lines.append("💡 提示：单场详情受 HLTV 官方限流，已自动从赛果/赛程库检索并呈现完整对局数据。")
 
         if match_id:
             lines.append(f"🆔 比赛ID：{match_id}")
