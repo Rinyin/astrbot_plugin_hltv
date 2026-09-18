@@ -1,0 +1,77 @@
+{
+    "api_base": {
+        "description": "HLTV API 服务基础地址",
+        "type": "string",
+        "default": "https://hltv.rinyin.top"
+    },
+    "server_ip": {
+        "description": "API 服务器直连 IP (用于防 DNS 污染/假 IP，留空则使用默认系统 DNS)",
+        "type": "string",
+        "default": "x.x.x.x"
+    },
+    "matchday_timezone": {
+        "description": "比赛日兜底时区 (系统优先根据比赛地区及城市动态识别当地时区；若无法识别时使用该兜底时区，默认 Europe/Berlin)",
+        "type": "string",
+        "default": "Europe/Berlin"
+    },
+    "min_stars": {
+        "description": "焦点赛事星级门槛 (用于辅助识别 T1/T2 赛事)",
+        "type": "int",
+        "default": 1
+    },
+    "notify_targets": {
+        "description": "提醒与赛程推送目标列表 (会话ID/群号，可通过 /hltv sub 快捷添加当前聊天)",
+        "type": "list",
+        "default": []
+    },
+    "match_reminder_enabled": {
+        "description": "是否开启赛前10分钟提醒",
+        "type": "bool",
+        "default": true
+    },
+    "result_report_enabled": {
+        "description": "是否开启赛后战报推送",
+        "type": "bool",
+        "default": true
+    },
+    "bo1_delay_minutes": {
+        "description": "BO1比赛开始后首次尝试获取战报的延迟时间 (分钟)",
+        "type": "int",
+        "default": 45
+    },
+    "bo3_delay_minutes": {
+        "description": "BO3比赛开始后首次尝试获取战报的延迟时间 (分钟)",
+        "type": "int",
+        "default": 120
+    },
+    "bo5_delay_minutes": {
+        "description": "BO5比赛开始后首次尝试获取战报的延迟时间 (分钟)",
+        "type": "int",
+        "default": 240
+    },
+    "result_retry_interval": {
+        "description": "若比赛尚未完赛，后续重试查询战报的间隔时间 (分钟)",
+        "type": "int",
+        "default": 10
+    },
+    "max_result_retries": {
+        "description": "战报查询最大重试次数 (超过后放弃追踪)",
+        "type": "int",
+        "default": 30
+    },
+    "daily_schedule_enabled": {
+        "description": "是否开启每日大型比赛赛程定时推送",
+        "type": "bool",
+        "default": true
+    },
+    "daily_schedule_time": {
+        "description": "每日赛程推送时间点 (24小时制 HH:MM，如 09:00)",
+        "type": "string",
+        "default": "09:00"
+    },
+    "timezone": {
+        "description": "本地显示时区名称 (默认 Asia/Shanghai，即北京时间)",
+        "type": "string",
+        "default": "Asia/Shanghai"
+    }
+}

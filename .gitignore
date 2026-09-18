@@ -1,0 +1,21 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temporary archives
+*.zip
+*.tar.gz
+
+# Local virtual environment
+.venv/
+env/
+venv/
+
+# IDE files
+.vscode/
+.idea/
+
+# Plugin runtime states / logs
+*.log
+*state*.json
