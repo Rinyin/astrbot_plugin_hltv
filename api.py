@@ -1,12 +1,12 @@
 import asyncio
-import logging
 import socket
 import time
 from typing import Any, Dict, List, Optional, Set
+
 import aiohttp
 from aiohttp.resolver import ThreadedResolver
 
-logger = logging.getLogger("astrbot")
+from astrbot.api import logger
 
 DEFAULT_HOST_MAP = {
     "hltv.rinyin.top": "x.x.x.x",
@@ -80,7 +80,9 @@ class HLTVClient:
             await self._session.close()
             self._session = None
 
-    async def _get(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    async def _get(
+        self, endpoint: str, params: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, Any]]:
         """发送 GET 请求并解析 JSON"""
         url = f"{self.base_url}{endpoint}"
         session = await self._get_session()
@@ -88,7 +90,9 @@ class HLTVClient:
             async with session.get(url, params=params) as resp:
                 if resp.status != 200:
                     text = await resp.text()
-                    logger.warning(f"[HLTV] 请求 {url} 失败: 状态码 {resp.status}, 响应: {text[:200]}")
+                    logger.warning(
+                        f"[HLTV] 请求 {url} 失败: 状态码 {resp.status}, 响应: {text[:200]}"
+                    )
                     return None
                 return await resp.json()
         except asyncio.TimeoutError:
@@ -109,7 +113,7 @@ class HLTVClient:
         offset: int = 0,
     ) -> List[Dict[str, Any]]:
         """获取比赛列表
-        
+
         Args:
             status: all | upcoming | live
             days: 未来 N 天内的比赛
@@ -125,7 +129,9 @@ class HLTVClient:
             return data.get("matches", [])
         return []
 
-    async def get_upcoming_matches(self, days: int = 2, limit: int = 100) -> List[Dict[str, Any]]:
+    async def get_upcoming_matches(
+        self, days: int = 2, limit: int = 100
+    ) -> List[Dict[str, Any]]:
         """获取即将进行的比赛"""
         return await self.get_matches(status="upcoming", days=days, limit=limit)
 
@@ -143,17 +149,54 @@ class HLTVClient:
     async def get_top_teams(self, max_age_seconds: float = 21600.0) -> Set[str]:
         """获取当前 HLTV 世界排名前 30 的战队名称（小写集合，带缓存）"""
         now = time.time()
-        if self._cached_top_teams and (now - self._top_teams_cached_at < max_age_seconds):
+        if self._cached_top_teams and (
+            now - self._top_teams_cached_at < max_age_seconds
+        ):
             return self._cached_top_teams
 
         teams: Set[str] = set()
         fallback_teams = {
-            "spirit", "falcons", "mouz", "furia", "vitality", "legacy", "fut", "g2",
-            "aurora", "natus vincere", "navi", "astralis", "betboom", "faze", "9z",
-            "the mongolz", "mongolz", "b8", "magic", "mibr", "parivision", "gamerlegion",
-            "alliance", "liquid", "3dmax", "inner circle", "big", "m80", "pain", "hotu",
-            "ninjas in pyjamas", "nip", "jijiehao", "heroic", "complexity", "virtus.pro",
-            "vp", "cloud9", "ence", "fnatic", "saw"
+            "spirit",
+            "falcons",
+            "mouz",
+            "furia",
+            "vitality",
+            "legacy",
+            "fut",
+            "g2",
+            "aurora",
+            "natus vincere",
+            "navi",
+            "astralis",
+            "betboom",
+            "faze",
+            "9z",
+            "the mongolz",
+            "mongolz",
+            "b8",
+            "magic",
+            "mibr",
+            "parivision",
+            "gamerlegion",
+            "alliance",
+            "liquid",
+            "3dmax",
+            "inner circle",
+            "big",
+            "m80",
+            "pain",
+            "hotu",
+            "ninjas in pyjamas",
+            "nip",
+            "jijiehao",
+            "heroic",
+            "complexity",
+            "virtus.pro",
+            "vp",
+            "cloud9",
+            "ence",
+            "fnatic",
+            "saw",
         }
         teams.update(fallback_teams)
 
@@ -178,7 +221,9 @@ class HLTVClient:
 
         return self._cached_top_teams or fallback_teams
 
-    async def get_results(self, days: Optional[int] = 7, limit: int = 100) -> List[Dict[str, Any]]:
+    async def get_results(
+        self, days: Optional[int] = 7, limit: int = 100
+    ) -> List[Dict[str, Any]]:
         """获取最近完赛结果"""
         params: Dict[str, Any] = {"limit": limit}
         if days is not None:

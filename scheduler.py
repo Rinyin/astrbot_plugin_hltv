@@ -1,35 +1,15 @@
 import asyncio
 import json
-import logging
 import os
-import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
 from zoneinfo import ZoneInfo
 
-try:
-    from astrbot.api.event import MessageEventResult
-    from astrbot.core.star import Context
-    from astrbot.core.utils.astrbot_path import get_astrbot_data_path
-except ImportError:
-    # 供独立单元测试/无AstrBot完整环境时使用
-    class MessageEventResult:
-        def __init__(self):
-            self._text = ""
-
-        def message(self, text: str):
-            self._text = text
-            return self
-
-    class Context:
-        pass
-
-    def get_astrbot_data_path():
-        return os.path.join(os.getcwd(), "data")
+from astrbot.api import logger
+from astrbot.api.event import MessageChain
+from astrbot.api.star import Context, StarTools
 
 from .api import HLTVClient
-
-logger = logging.getLogger("astrbot")
 
 # 全球常见赛区与城市时区映射表（用于按比赛当地真实时区动态划分比赛日）
 REGION_TIMEZONES: Dict[str, str] = {
@@ -47,24 +27,97 @@ REGION_TIMEZONES: Dict[str, str] = {
 
 CITY_KEYWORD_TIMEZONES: List[Tuple[List[str], str]] = [
     # 南美赛区
-    (["curitiba", "rio", "sao paulo", "brasil", "brazil", "argentina", "chile", "cbcs", "south america", "sa "], "America/Sao_Paulo"),
+    (
+        [
+            "curitiba",
+            "rio",
+            "sao paulo",
+            "brasil",
+            "brazil",
+            "argentina",
+            "chile",
+            "cbcs",
+            "south america",
+            "sa ",
+        ],
+        "America/Sao_Paulo",
+    ),
     # 北美赛区
-    (["dallas", "atlanta", "austin", "chicago", "los angeles", "columbus", "north america", "na "], "America/New_York"),
+    (
+        [
+            "dallas",
+            "atlanta",
+            "austin",
+            "chicago",
+            "los angeles",
+            "columbus",
+            "north america",
+            "na ",
+        ],
+        "America/New_York",
+    ),
     # 亚洲与中国赛区
-    (["shanghai", "chengdu", "beijing", "china", "mongolia", "ulaanbaatar", "singapore", "asia"], "Asia/Shanghai"),
+    (
+        [
+            "shanghai",
+            "chengdu",
+            "beijing",
+            "china",
+            "mongolia",
+            "ulaanbaatar",
+            "singapore",
+            "asia",
+        ],
+        "Asia/Shanghai",
+    ),
     # 大洋洲赛区
-    (["melbourne", "sydney", "australia", "oceania", "nz", "new zealand"], "Australia/Sydney"),
+    (
+        ["melbourne", "sydney", "australia", "oceania", "nz", "new zealand"],
+        "Australia/Sydney",
+    ),
     # 独联体赛区
     (["moscow", "almaty", "cis"], "Europe/Moscow"),
     # 欧洲赛区 (世界 CS2 核心赛区)
-    (["cologne", "katowice", "copenhagen", "paris", "london", "malta", "warsaw", "espoo", "valencia", "berlin", "bucharest", "belgrade", "epl", "starladder", "blast", "iem", "europe", "european", "nordic", "sweden", "denmark", "germany"], "Europe/Berlin"),
+    (
+        [
+            "cologne",
+            "katowice",
+            "copenhagen",
+            "paris",
+            "london",
+            "malta",
+            "warsaw",
+            "espoo",
+            "valencia",
+            "berlin",
+            "bucharest",
+            "belgrade",
+            "epl",
+            "starladder",
+            "blast",
+            "iem",
+            "europe",
+            "european",
+            "nordic",
+            "sweden",
+            "denmark",
+            "germany",
+        ],
+        "Europe/Berlin",
+    ),
 ]
 
 
 class HLTVScheduler:
     """HLTV 比赛提醒、战报追踪与每日赛程调度器"""
 
-    def __init__(self, context: Context, config: dict, client: HLTVClient):
+    def __init__(
+        self,
+        context: Context,
+        config: dict,
+        client: HLTVClient,
+        plugin_name: str = "astrbot_plugin_hltv",
+    ):
         self.context = context
         self.config = config
         self.client = client
@@ -82,17 +135,13 @@ class HLTVScheduler:
         self.starred_match_ids: Set[str] = set()
         self.starred_event_names: Set[str] = set()
 
-        # 缓存状态文件路径
-        try:
-            data_dir = get_astrbot_data_path()
-        except Exception:
-            data_dir = os.path.join(os.getcwd(), "data")
-        os.makedirs(data_dir, exist_ok=True)
-        self.state_file_path = os.path.join(data_dir, "astrbot_plugin_hltv_state.json")
+        # 运行状态持久化文件，存放于 data/plugin_data/<plugin_name>/ 下（框架标准数据目录）
+        data_dir = StarTools.get_data_dir(plugin_name)
+        self.state_file_path = os.path.join(str(data_dir), "state.json")
 
         self._load_state()
 
-    def _get_tz(self) -> ZoneInfo:
+    def get_tz(self) -> ZoneInfo:
         """用户显示时区（默认 Asia/Shanghai，即北京时间）"""
         tz_name = self.config.get("timezone", "Asia/Shanghai")
         try:
@@ -103,11 +152,13 @@ class HLTVScheduler:
 
     def get_default_matchday_tz(self) -> ZoneInfo:
         """兜底比赛日时区（当比赛无法推断赛区时使用，默认 Europe/Berlin 欧洲当地时区）"""
-        tz_name = self.config.get("default_matchday_timezone", self.config.get("matchday_timezone", "Europe/Berlin"))
+        tz_name = self.config.get("matchday_timezone", "Europe/Berlin")
         try:
             return ZoneInfo(tz_name)
         except Exception as e:
-            logger.warning(f"[HLTV] 兜底比赛日时区 {tz_name} 无效，退回 Europe/Berlin: {e}")
+            logger.warning(
+                f"[HLTV] 兜底比赛日时区 {tz_name} 无效，退回 Europe/Berlin: {e}"
+            )
             return ZoneInfo("Europe/Berlin")
 
     def get_match_timezone(self, match: Optional[Dict[str, Any]]) -> ZoneInfo:
@@ -120,30 +171,35 @@ class HLTVScheduler:
         # 1. 优先读取比赛对象的 region 字段
         region = (match.get("region") or "").strip().lower()
         if region in REGION_TIMEZONES:
-            tz_name = REGION_TIMEZONES[region]
-            try:
-                return ZoneInfo(tz_name)
-            except Exception:
-                pass
+            tz = self._safe_zoneinfo(REGION_TIMEZONES[region])
+            if tz:
+                return tz
 
         # 2. 匹配赛事名称/城市关键词
         ev_name = ((match.get("event") or {}).get("name") or "").lower()
         for kw, tz_name in REGION_TIMEZONES.items():
             if kw in ev_name:
-                try:
-                    return ZoneInfo(tz_name)
-                except Exception:
-                    pass
+                tz = self._safe_zoneinfo(tz_name)
+                if tz:
+                    return tz
 
         for kws, tz_name in CITY_KEYWORD_TIMEZONES:
             if any(kw in ev_name for kw in kws):
-                try:
-                    return ZoneInfo(tz_name)
-                except Exception:
-                    pass
+                tz = self._safe_zoneinfo(tz_name)
+                if tz:
+                    return tz
 
         # 3. 兜底
         return self.get_default_matchday_tz()
+
+    @staticmethod
+    def _safe_zoneinfo(tz_name: str) -> Optional[ZoneInfo]:
+        """安全构造 ZoneInfo，时区名无效时返回 None 并记录日志"""
+        try:
+            return ZoneInfo(tz_name)
+        except Exception as e:
+            logger.warning(f"[HLTV] 时区映射表中的时区名 {tz_name} 无效: {e}")
+            return None
 
     def get_matchday(self, match_or_ts: Any, ts: Optional[float] = None) -> str:
         """获取比赛对应的当地比赛日字符串（格式 YYYY-MM-DD）。
@@ -153,7 +209,7 @@ class HLTVScheduler:
         target_ts = None
         if isinstance(match_or_ts, dict):
             match = match_or_ts
-            target_ts = ts if ts is not None else self._parse_starts_at_ts(match)
+            target_ts = ts if ts is not None else self.parse_starts_at_ts(match)
         elif isinstance(match_or_ts, (int, float)):
             target_ts = float(match_or_ts)
 
@@ -166,12 +222,12 @@ class HLTVScheduler:
 
     def get_current_matchday(self) -> str:
         """获取当前用户参考比赛日字符串（以用户显示时区当前日期为基准）"""
-        now = datetime.now(tz=self._get_tz())
+        now = datetime.now(tz=self.get_tz())
         return now.strftime("%Y-%m-%d")
 
     def get_next_matchday(self, days: int = 1) -> str:
         """获取后续比赛日字符串（以用户显示时区当前日期为基准）"""
-        now = datetime.now(tz=self._get_tz())
+        now = datetime.now(tz=self.get_tz())
         return (now + timedelta(days=days)).strftime("%Y-%m-%d")
 
     def _load_state(self) -> None:
@@ -193,7 +249,7 @@ class HLTVScheduler:
                     f"记录焦点赛事 {len(self.starred_event_names)} 个"
                 )
         except Exception as e:
-            logger.error(f"[HLTV] 载入状态文件失败: {e}")
+            logger.error(f"[HLTV] 载入状态文件失败: {e}", exc_info=True)
 
     def _save_state(self) -> None:
         """持久化保存状态"""
@@ -215,7 +271,7 @@ class HLTVScheduler:
             with open(self.state_file_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            logger.error(f"[HLTV] 保存状态文件失败: {e}")
+            logger.error(f"[HLTV] 保存状态文件失败: {e}", exc_info=True)
 
     def start(self) -> None:
         """启动后台轮询任务"""
@@ -247,12 +303,12 @@ class HLTVScheduler:
 
         for target in targets:
             try:
-                await self.context.send_message(target, MessageEventResult().message(text))
+                await self.context.send_message(target, MessageChain().message(text))
                 await asyncio.sleep(0.3)  # 限速保护
             except Exception as e:
-                logger.error(f"[HLTV] 向目标 {target} 发送消息失败: {e}")
+                logger.error(f"[HLTV] 向目标 {target} 发送消息失败: {e}", exc_info=True)
 
-    def _parse_starts_at_ts(self, match: Dict[str, Any]) -> Optional[float]:
+    def parse_starts_at_ts(self, match: Dict[str, Any]) -> Optional[float]:
         """解析比赛开始时间戳（秒）"""
         unix_ms = match.get("starts_at_unix_ms")
         if unix_ms:
@@ -263,13 +319,13 @@ class HLTVScheduler:
             try:
                 dt = datetime.fromisoformat(starts_at_str.replace("Z", "+00:00"))
                 return dt.timestamp()
-            except Exception:
-                pass
+            except (ValueError, TypeError) as e:
+                logger.debug(f"[HLTV] 无法解析比赛开始时间 {starts_at_str!r}: {e}")
         return None
 
     async def get_match_tier(self, match: Dict[str, Any]) -> str:
         """根据赛事名称、奖金池、队伍与星级判断赛事级别 (直接显示 T1 / T2 / T3，不显示星级)
-        
+
         - T1 (顶尖/精英赛事): Major, IEM, ESL Pro League, BLAST Premier, StarLadder, EWC, PGL, BetBoom Dacha, 或 HLTV 3星及以上
         - T2 (大型/焦点赛事): Thunderpick, Skyesports, YaLLa, FireLeague, Logitech, ESL Challenger, 或含有世界 Top 30 强队, 或 HLTV 1~2星
         - T3 (次级/普通比赛): 区域公开预选赛、未达标普通次级杯赛
@@ -279,12 +335,24 @@ class HLTVScheduler:
         stars = match.get("stars") or 0
 
         t1_keywords = [
-            "major", "iem", "esl pro league", "blast", "starladder",
-            "ewc", "esports world cup", "pgl", "betboom dacha"
+            "major",
+            "iem",
+            "esl pro league",
+            "blast",
+            "starladder",
+            "ewc",
+            "esports world cup",
+            "pgl",
+            "betboom dacha",
         ]
         t2_keywords = [
-            "thunderpick", "skyesports", "yalla", "fireleague",
-            "logitech", "esl challenger", "cct global"
+            "thunderpick",
+            "skyesports",
+            "yalla",
+            "fireleague",
+            "logitech",
+            "esl challenger",
+            "cct global",
         ]
 
         if any(k in ev_name for k in t1_keywords) or stars >= 3:
@@ -299,8 +367,8 @@ class HLTVScheduler:
             top_teams = await self.client.get_top_teams()
             if (t1_name and t1_name in top_teams) or (t2_name and t2_name in top_teams):
                 return "T2"
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"[HLTV] 判断强队级别时获取排名失败: {e}", exc_info=True)
 
         return "T3"
 
@@ -333,15 +401,17 @@ class HLTVScheduler:
 
         fmt = (match.get("format") or "BO3").upper()
 
-        tz = self._get_tz()
-        starts_ts = self._parse_starts_at_ts(match)
+        tz = self.get_tz()
+        starts_ts = self.parse_starts_at_ts(match)
         time_str = "即将开赛"
         if starts_ts:
             dt = datetime.fromtimestamp(starts_ts, tz=tz)
             time_str = dt.strftime("%H:%M")
 
         match_id = match.get("id") or ""
-        url = match.get("url") or (f"https://www.hltv.org/matches/{match_id}" if match_id else "")
+        url = match.get("url") or (
+            f"https://www.hltv.org/matches/{match_id}" if match_id else ""
+        )
 
         id_str = f"🆔 比赛ID：{match_id}\n" if match_id else ""
         return (
@@ -431,7 +501,7 @@ class HLTVScheduler:
         fmt = (detail.get("format") or "BO3").upper()
 
         lines = [
-            f"🏁 【HLTV 比赛战报】",
+            "🏁 【HLTV 比赛战报】",
             f"🏆 赛事：{event_name}",
             f"⚔️ 总比分：{team1_name} {s1} - {s2} {team2_name} ({fmt}){winner_str}",
             "------------------------",
@@ -447,13 +517,17 @@ class HLTVScheduler:
                 m_s2 = m.get("team2_score", 0)
                 picked_by = m.get("picked_by")
                 pick_str = f" ({picked_by} 选图)" if picked_by else ""
-                lines.append(f"  • 图{idx} {map_name}：{team1_name} {m_s1} - {m_s2} {team2_name}{pick_str}")
+                lines.append(
+                    f"  • 图{idx} {map_name}：{team1_name} {m_s1} - {m_s2} {team2_name}{pick_str}"
+                )
             lines.append("------------------------")
 
         # 选手表现 (全员 KDA, ADR, Rating, KAST，分队显示)
         player_stats = detail.get("player_stats", [])
         if player_stats:
-            t1_players, t2_players = self.group_players_by_team(player_stats, team1_name, team2_name)
+            t1_players, t2_players = self.group_players_by_team(
+                player_stats, team1_name, team2_name
+            )
             if t1_players:
                 lines.append(f"🔹 {team1_name} 全场选手数据：")
                 for p in t1_players:
@@ -467,13 +541,17 @@ class HLTVScheduler:
         if match_id:
             lines.append(f"🆔 比赛ID：{match_id}")
             lines.append(f"💡 发送 /hltv match {match_id} <图号> 可查看单图全员数据")
-        url = detail.get("url") or (f"https://www.hltv.org/matches/{match_id}" if match_id else "")
+        url = detail.get("url") or (
+            f"https://www.hltv.org/matches/{match_id}" if match_id else ""
+        )
         if url:
             lines.append(f"🔗 HLTV页面：{url}")
 
         return "\n".join(lines)
 
-    def format_match_detail(self, detail: Dict[str, Any], map_query: Optional[str] = None) -> str:
+    def format_match_detail(
+        self, detail: Dict[str, Any], map_query: Optional[str] = None
+    ) -> str:
         """格式化比赛详细数据，支持全场统计或单图数据查询"""
         match_id = str(detail.get("id") or "")
         event_info = detail.get("event") or {}
@@ -498,7 +576,9 @@ class HLTVScheduler:
         status_str = status_map.get(status, status)
 
         maps = detail.get("maps", [])
-        map_player_stats: Dict[str, List[Dict[str, Any]]] = detail.get("map_player_stats") or {}
+        map_player_stats: Dict[str, List[Dict[str, Any]]] = (
+            detail.get("map_player_stats") or {}
+        )
 
         # 如果指定了地图编号或名称
         if map_query:
@@ -519,7 +599,11 @@ class HLTVScheduler:
                 # 2. 尝试按地图名称匹配 (如 "inferno", "de_inferno", "anubis" 等)
                 for idx, m in enumerate(maps, 1):
                     m_name = (m.get("name") or "").lower()
-                    if clean_q in m_name or m_name in clean_q or clean_q.replace("de_", "") in m_name:
+                    if (
+                        clean_q in m_name
+                        or m_name in clean_q
+                        or clean_q.replace("de_", "") in m_name
+                    ):
                         target_map_idx = idx
                         target_map_obj = m
                         target_map_name = m.get("name")
@@ -533,7 +617,9 @@ class HLTVScheduler:
                             break
 
             if not target_map_name:
-                available_maps = [f"图{i} {m.get('name')}" for i, m in enumerate(maps, 1)]
+                available_maps = [
+                    f"图{i} {m.get('name')}" for i, m in enumerate(maps, 1)
+                ]
                 avail_str = "、".join(available_maps) if available_maps else "暂无"
                 return (
                     f"⚠️ 未找到对应地图「{map_query}」。\n"
@@ -549,7 +635,11 @@ class HLTVScheduler:
                         p_stats = v
                         break
 
-            m_title = f"图{target_map_idx} {target_map_name}" if target_map_idx else target_map_name
+            m_title = (
+                f"图{target_map_idx} {target_map_name}"
+                if target_map_idx
+                else target_map_name
+            )
             lines = [
                 f"📊 【HLTV 单图数据详情 - {m_title}】",
                 f"🏆 赛事：{event_name}",
@@ -562,7 +652,9 @@ class HLTVScheduler:
                 pick_str = f" ({picked_by} 选图)" if picked_by else ""
                 half_scores = target_map_obj.get("half_scores") or []
                 half_str = f" (半场: {', '.join(half_scores)})" if half_scores else ""
-                lines.append(f"⚔️ 比分：{team1_name} {m_s1} - {m_s2} {team2_name}{pick_str}{half_str}")
+                lines.append(
+                    f"⚔️ 比分：{team1_name} {m_s1} - {m_s2} {team2_name}{pick_str}{half_str}"
+                )
             lines.append("------------------------")
 
             if p_stats:
@@ -582,7 +674,9 @@ class HLTVScheduler:
             if match_id:
                 lines.append(f"🆔 比赛ID：{match_id}")
                 lines.append(f"💡 发送 /hltv match {match_id} 可返回查看全场总数据")
-            url = detail.get("url") or (f"https://www.hltv.org/matches/{match_id}" if match_id else "")
+            url = detail.get("url") or (
+                f"https://www.hltv.org/matches/{match_id}" if match_id else ""
+            )
             if url:
                 lines.append(f"🔗 HLTV页面：{url}")
             return "\n".join(lines)
@@ -597,7 +691,7 @@ class HLTVScheduler:
         winner_str = f" 🏆 {winner_name} 获胜！" if winner_name else ""
 
         lines = [
-            f"📊 【HLTV 比赛数据详情 - 全场统计】",
+            "📊 【HLTV 比赛数据详情 - 全场统计】",
             f"🏆 赛事：{event_name}",
             f"⚔️ 总比分：{team1_name} {s1} - {s2} {team2_name} ({fmt}) [{status_str}]{winner_str}",
             "------------------------",
@@ -612,13 +706,17 @@ class HLTVScheduler:
                 m_s2 = m.get("team2_score", 0)
                 picked_by = m.get("picked_by")
                 pick_str = f" ({picked_by} 选图)" if picked_by else ""
-                lines.append(f"  • 图{idx} {map_name}：{team1_name} {m_s1} - {m_s2} {team2_name}{pick_str}")
+                lines.append(
+                    f"  • 图{idx} {map_name}：{team1_name} {m_s1} - {m_s2} {team2_name}{pick_str}"
+                )
             lines.append("------------------------")
 
         # 全场选手数据 (全员 KDA, ADR, Rating, KAST)
         player_stats = detail.get("player_stats", [])
         if player_stats:
-            t1_players, t2_players = self.group_players_by_team(player_stats, team1_name, team2_name)
+            t1_players, t2_players = self.group_players_by_team(
+                player_stats, team1_name, team2_name
+            )
             if t1_players:
                 lines.append(f"🔹 {team1_name} 全场选手数据：")
                 for p in t1_players:
@@ -635,29 +733,38 @@ class HLTVScheduler:
         if match_id:
             lines.append(f"🆔 比赛ID：{match_id}")
             if maps:
-                lines.append(f"💡 发送 /hltv match {match_id} <图号> 查看单图数据（例如: /hltv match {match_id} 1）")
-        url = detail.get("url") or (f"https://www.hltv.org/matches/{match_id}" if match_id else "")
+                lines.append(
+                    f"💡 发送 /hltv match {match_id} <图号> 查看单图数据（例如: /hltv match {match_id} 1）"
+                )
+        url = detail.get("url") or (
+            f"https://www.hltv.org/matches/{match_id}" if match_id else ""
+        )
         if url:
             lines.append(f"🔗 HLTV页面：{url}")
 
         return "\n".join(lines)
 
     def format_daily_schedule(
-        self, matches: List[Dict[str, Any]], matchday_str: str, is_next_day: bool = False
+        self,
+        matches: List[Dict[str, Any]],
+        matchday_str: str,
+        is_next_day: bool = False,
     ) -> str:
         """格式化比赛日焦点赛事赛程
-        
+
         Args:
             matches: 焦点比赛列表
             matchday_str: 比赛日字符串 (YYYY-MM-DD，按 matchday_timezone 划分)
             is_next_day: 是否为当日全部完赛后自动展示的次日预告
         """
-        tz = self._get_tz()
+        tz = self.get_tz()
         now = datetime.now(tz=tz)
         today_local_date = now.strftime("%Y-%m-%d")
 
         if is_next_day:
-            header_title = f"📅 【HLTV 今日焦点赛程已全部结束，明日预告 (比赛日 {matchday_str})】"
+            header_title = (
+                f"📅 【HLTV 今日焦点赛程已全部结束，明日预告 (比赛日 {matchday_str})】"
+            )
         else:
             header_title = f"📅 【HLTV 今日焦点赛事预告 (比赛日 {matchday_str})】"
 
@@ -680,7 +787,7 @@ class HLTVScheduler:
                 m_id = m.get("id")
 
                 time_str = "--:--"
-                ts = self._parse_starts_at_ts(m)
+                ts = self.parse_starts_at_ts(m)
                 if ts:
                     dt_user = datetime.fromtimestamp(ts, tz=tz)
                     user_date = dt_user.strftime("%Y-%m-%d")
@@ -723,14 +830,14 @@ class HLTVScheduler:
         next_match_hint: Optional[str] = None,
     ) -> str:
         """格式化比赛日完赛赛果
-        
+
         Args:
             matches: 完赛的大型比赛列表
             matchday_str: 比赛日字符串 (YYYY-MM-DD)
             is_today: 是否为当前比赛日
             next_match_hint: 若今日尚未完赛，提示今日首场开赛时间的文案
         """
-        tz = self._get_tz()
+        tz = self.get_tz()
 
         if is_today:
             header_title = f"🏁 【HLTV 今日焦点赛果 (比赛日 {matchday_str})】"
@@ -757,11 +864,13 @@ class HLTVScheduler:
                 m_id = m.get("id")
 
                 winner = team1 if s1 > s2 else (team2 if s2 > s1 else "平局")
-                url = m.get("url") or (f"https://www.hltv.org/matches/{m_id}" if m_id else "")
+                url = m.get("url") or (
+                    f"https://www.hltv.org/matches/{m_id}" if m_id else ""
+                )
 
                 # 比赛开打时间 (用户本地时区时间与比赛当地时间)
                 time_str = ""
-                ts = self._parse_starts_at_ts(m)
+                ts = self.parse_starts_at_ts(m)
                 if ts:
                     dt_user = datetime.fromtimestamp(ts, tz=tz)
                     cst_label = dt_user.strftime("%H:%M")
@@ -802,7 +911,9 @@ class HLTVScheduler:
         current_matchday = self.get_current_matchday()
 
         if current_hm == target_time and self.last_daily_date != current_matchday:
-            logger.info(f"[HLTV] 触发每日赛程定时推送: 比赛日 {current_matchday} {current_hm}")
+            logger.info(
+                f"[HLTV] 触发每日赛程定时推送: 比赛日 {current_matchday} {current_hm}"
+            )
             self.last_daily_date = current_matchday
             self._save_state()
 
@@ -815,13 +926,13 @@ class HLTVScheduler:
                 if tier not in ("T1", "T2"):
                     continue
                 m["tier"] = tier
-                ts = self._parse_starts_at_ts(m)
+                ts = self.parse_starts_at_ts(m)
                 if ts:
                     m_day = self.get_matchday(m, ts)
                     if m_day == current_matchday:
                         today_major_matches.append(m)
 
-            today_major_matches.sort(key=lambda x: self._parse_starts_at_ts(x) or 0)
+            today_major_matches.sort(key=lambda x: self.parse_starts_at_ts(x) or 0)
             msg = self.format_daily_schedule(today_major_matches, current_matchday)
             await self.broadcast_message(msg)
 
@@ -840,7 +951,7 @@ class HLTVScheduler:
             if not match_id:
                 continue
 
-            starts_ts = self._parse_starts_at_ts(match)
+            starts_ts = self.parse_starts_at_ts(match)
             if not starts_ts:
                 continue
 
@@ -850,7 +961,9 @@ class HLTVScheduler:
             if 0 <= time_diff <= 600:
                 if match_id not in self.reminded_match_ids:
                     self.reminded_match_ids.add(match_id)
-                    logger.info(f"[HLTV] 触发赛前10分钟提醒: 比赛ID {match_id} 即将在 {time_diff:.0f}s 后开赛")
+                    logger.info(
+                        f"[HLTV] 触发赛前10分钟提醒: 比赛ID {match_id} 即将在 {time_diff:.0f}s 后开赛"
+                    )
 
                     if reminder_enabled:
                         msg = self.format_match_reminder(match, tier=tier)
@@ -862,11 +975,16 @@ class HLTVScheduler:
 
             # 如果比赛已经开始（0 ~ 30分钟内）但之前未追踪，也加入战报追踪
             elif -1800 <= time_diff < 0:
-                if match_id not in self.tracking_matches and match_id not in self.reported_match_ids:
+                if (
+                    match_id not in self.tracking_matches
+                    and match_id not in self.reported_match_ids
+                ):
                     self._register_tracking_match(match, starts_ts, now_ts)
                     self._save_state()
 
-    def _register_tracking_match(self, match: Dict[str, Any], starts_ts: float, now_ts: float) -> None:
+    def _register_tracking_match(
+        self, match: Dict[str, Any], starts_ts: float, now_ts: float
+    ) -> None:
         """将比赛登记到赛后战报轮询追踪队列"""
         match_id = str(match.get("id"))
         if match_id in self.tracking_matches or match_id in self.reported_match_ids:
@@ -891,7 +1009,7 @@ class HLTVScheduler:
         }
         logger.info(
             f"[HLTV] 登记赛后战报追踪: 比赛 {match_id} ({fmt}), 预计在开赛后 {delay_min} 分钟 "
-            f"({datetime.fromtimestamp(first_check_ts, tz=self._get_tz()).strftime('%H:%M')}) 首次获取战报"
+            f"({datetime.fromtimestamp(first_check_ts, tz=self.get_tz()).strftime('%H:%M')}) 首次获取战报"
         )
 
     async def check_tracking_results(self, now_ts: float) -> None:
@@ -936,7 +1054,9 @@ class HLTVScheduler:
                 info["retry_count"] = retry_count
 
                 if retry_count >= max_retries:
-                    logger.warning(f"[HLTV] 比赛 {match_id} 超过最大重试次数 ({max_retries})，停止追踪。")
+                    logger.warning(
+                        f"[HLTV] 比赛 {match_id} 超过最大重试次数 ({max_retries})，停止追踪。"
+                    )
                     self.tracking_matches.pop(match_id, None)
                     self._save_state()
                 else:
@@ -954,7 +1074,7 @@ class HLTVScheduler:
 
         while self._running:
             try:
-                now = datetime.now(tz=self._get_tz())
+                now = datetime.now(tz=self.get_tz())
                 now_ts = now.timestamp()
 
                 # 1. 每日固定时间赛程推送检查

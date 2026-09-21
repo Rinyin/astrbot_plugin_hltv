@@ -18,4 +18,3 @@ venv/
 
 # Plugin runtime states / logs
 *.log
-*state*.json

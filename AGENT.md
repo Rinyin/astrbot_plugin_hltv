@@ -20,8 +20,7 @@
 - **API 接口地址**：`https://hltv.rinyin.top`
 - **API 在线文档**：`https://hltv.rinyin.top/docs`
 - **后端服务器基础设施**：
-  - 服务器信息：`example.host`
-  - SSH 认证密钥：`(redacted)`
+  - 服务器直连 IP：`x.x.x.x`（SSH 账号与密钥路径不得写入仓库，仅保存在本地）
 - **网络防污染与直连机制**：
   - Windows 环境下常存在 TUN/Clash 等代理软件接管流量（产生 Fake-IP，导致 TLS 握手异常或 DNS 污染）。
   - 插件内置 `HostResolver`，将 `hltv.rinyin.top` 强行绑定直连至真实后端 IP `x.x.x.x`，并在发生网络抖动或超时（15s）时具备完善的容错处理。
@@ -86,7 +85,7 @@
 - **动态赛区与时区识别 (`get_match_timezone`)**：
   - 优先读取比赛数据的 `region` 字段（`Europe`, `Americas`, `North America`, `South America`, `Asia`, `Oceania`, `CIS` 等）。
   - 若无明确字段，深入解析赛事名称与主办城市关键词（如 Curitiba, Rio -> `America/Sao_Paulo`；Dallas, Atlanta -> `America/New_York`；Cologne, Katowice, Malta -> `Europe/Berlin`；Shanghai, Chengdu -> `Asia/Shanghai`；Melbourne, Sydney -> `Australia/Sydney` 等）。
-  - 提供可配置的兜底时区 `default_matchday_timezone`（默认 `Europe/Berlin`）。
+  - 提供可配置的兜底时区 `matchday_timezone`（默认 `Europe/Berlin`，与 `_conf_schema.json` 键名一致）。
 - **动态比赛日换算 (`get_matchday`)**：
   - 针对每场比赛，以其**主办地真实时区**换算当地比赛日（`YYYY-MM-DD`）。
 - **双时区并存展示**：
@@ -143,4 +142,17 @@
 - **托管平台**：GitHub
 - **仓库地址**：`https://github.com/Rinyin/astrbot_plugin_hltv`
 - **私有属性要求（绝对约束）**：**必须为私有仓库（Private）**，禁止设为公开。
-- **.gitignore 过滤项**：必须忽略 `__pycache__/`, `*.pyc`, `*.zip`, `*.log`, `*state*.json`, `.venv/` 等临时与敏感运行文件。
+- **.gitignore 过滤项**：必须忽略 `__pycache__/`, `*.pyc`, `*.zip`, `*.log`, `.venv/` 等临时文件。运行状态文件不在插件目录内，无需忽略。
+
+---
+
+## 9. AstrBot 插件开发准则（强制）
+
+- 插件主类位于 `main.py`，继承 `Star`，必须使用 `@register(...)` 装饰器注册；不得依赖按类名猜测的旧版加载方式。
+- 仅从 `astrbot.api` 及其子包导入框架符号（`logger`、`AstrBotConfig`、`MessageChain`、`StarTools` 等），不得直接引用 `astrbot.core.*` 私有路径。
+- 日志统一使用 `from astrbot.api import logger`，捕获异常时记录 `exc_info=True`，禁止 `except Exception: pass` 静默吞错。
+- 持久化数据（运行状态等）必须写入 `StarTools.get_data_dir()` 返回的 `data/plugin_data/astrbot_plugin_hltv/` 目录，不得写入 `data/` 根目录或插件目录。
+- 配置只通过 `_conf_schema.json` 声明，代码中读取的配置键名必须与 schema 完全一致。
+- 每次提交前必须运行 `ruff check` 与 `ruff format`，且通过。
+- `metadata.yaml` 与 `@register` 的版本号保持同步。
+

@@ -1,24 +1,29 @@
-import logging
 from datetime import datetime
-from typing import Any, Dict, List, Optional
-from zoneinfo import ZoneInfo
+from typing import Any, Dict, List
 
+from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import Context, Star
-from astrbot.core.config.astrbot_config import AstrBotConfig
+from astrbot.api.star import Context, Star, register
 
 from .api import HLTVClient
 from .scheduler import HLTVScheduler
 
-logger = logging.getLogger("astrbot")
+PLUGIN_NAME = "astrbot_plugin_hltv"
 
 
-class Main(Star):
+@register(
+    PLUGIN_NAME,
+    "Rinyi",
+    "HLTV CS2 大型比赛赛前10分钟提醒、赛后战报获取与每日赛程推送",
+    "1.0.1",
+    "https://github.com/Rinyi/astrbot_plugin_hltv",
+)
+class HLTVPlugin(Star):
     """HLTV CS2 大型比赛自动提醒、战报获取与每日赛程推送插件"""
 
-    def __init__(self, context: Context, config: Optional[Dict[str, Any]] = None):
+    def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
-        self.config = config if config is not None else {}
+        self.config = config
 
         # 确保 notify_targets 列表存在
         if "notify_targets" not in self.config:
@@ -31,6 +36,7 @@ class Main(Star):
             context=self.context,
             config=self.config,
             client=self.client,
+            plugin_name=PLUGIN_NAME,
         )
 
     async def initialize(self):
@@ -45,12 +51,11 @@ class Main(Star):
         logger.info("[HLTV] HLTV 赛事推送插件已终止。")
 
     def _save_config(self):
-        """保存配置更改"""
-        if isinstance(self.config, AstrBotConfig):
-            try:
-                self.config.save_config()
-            except Exception as e:
-                logger.error(f"[HLTV] 保存配置文件失败: {e}")
+        """保存配置更改到 data/config/<plugin>_config.json"""
+        try:
+            self.config.save_config()
+        except Exception as e:
+            logger.error(f"[HLTV] 保存配置文件失败: {e}", exc_info=True)
 
     # ==========================
     # 指令组: /hltv
@@ -80,7 +85,9 @@ class Main(Star):
         yield event.plain_result(help_text)
 
     @hltv.command("match", alias={"比赛", "数据", "战报详情", "比赛详情"})
-    async def hltv_match(self, event: AstrMessageEvent, query: str = "", map_arg: str = ""):
+    async def hltv_match(
+        self, event: AstrMessageEvent, query: str = "", map_arg: str = ""
+    ):
         """查看指定比赛的全员KDA、Rating及单图详细数据。用法: /hltv match <比赛ID或战队名称> [图号]"""
         clean_q = query.strip()
         if not clean_q:
@@ -97,16 +104,22 @@ class Main(Star):
 
         detail = await self.client.find_match(clean_q)
         if not detail:
-            yield event.plain_result(f"❌ 未找到与「{clean_q}」相关的比赛数据。\n提示：可使用数字比赛ID或更精确的战队名重新查询。")
+            yield event.plain_result(
+                f"❌ 未找到与「{clean_q}」相关的比赛数据。\n提示：可使用数字比赛ID或更精确的战队名重新查询。"
+            )
             return
 
         # 若 find_match 仅返回简略信息，且有 id，尝试获取全量 detail
-        if ("player_stats" not in detail or not detail.get("player_stats")) and detail.get("id"):
+        if (
+            "player_stats" not in detail or not detail.get("player_stats")
+        ) and detail.get("id"):
             full_detail = await self.client.get_match_detail(str(detail.get("id")))
             if full_detail:
                 detail = full_detail
 
-        msg = self.scheduler.format_match_detail(detail, map_query=map_arg.strip() if map_arg else None)
+        msg = self.scheduler.format_match_detail(
+            detail, map_query=map_arg.strip() if map_arg else None
+        )
         yield event.plain_result(msg)
 
     @hltv.command("today", alias={"赛程", "今日赛程"})
@@ -124,13 +137,13 @@ class Main(Star):
         # 按比赛日时区归类
         by_matchday: Dict[str, List[Dict[str, Any]]] = {}
         for m in major_matches:
-            ts = self.scheduler._parse_starts_at_ts(m)
+            ts = self.scheduler.parse_starts_at_ts(m)
             if ts:
                 m_day = self.scheduler.get_matchday(m, ts)
                 by_matchday.setdefault(m_day, []).append(m)
 
         today_matches = by_matchday.get(current_matchday, [])
-        today_matches.sort(key=lambda x: self.scheduler._parse_starts_at_ts(x) or 0)
+        today_matches.sort(key=lambda x: self.scheduler.parse_starts_at_ts(x) or 0)
 
         # 判断今日是否还有正在进行或尚未开赛的比赛
         has_active_matches = False
@@ -142,17 +155,27 @@ class Main(Star):
 
         if today_matches and has_active_matches:
             # 今日仍有比赛未打完，展示今日完整焦点赛程
-            msg = self.scheduler.format_daily_schedule(today_matches, current_matchday, is_next_day=False)
+            msg = self.scheduler.format_daily_schedule(
+                today_matches, current_matchday, is_next_day=False
+            )
         else:
             # 今日焦点赛事已全部打完或今日无大型比赛，自动展示次日赛程预告
-            future_days = sorted([d for d in by_matchday.keys() if d > current_matchday])
+            future_days = sorted(
+                [d for d in by_matchday.keys() if d > current_matchday]
+            )
             if future_days:
                 next_day = future_days[0]
                 next_matches = by_matchday[next_day]
-                next_matches.sort(key=lambda x: self.scheduler._parse_starts_at_ts(x) or 0)
-                msg = self.scheduler.format_daily_schedule(next_matches, next_day, is_next_day=True)
+                next_matches.sort(
+                    key=lambda x: self.scheduler.parse_starts_at_ts(x) or 0
+                )
+                msg = self.scheduler.format_daily_schedule(
+                    next_matches, next_day, is_next_day=True
+                )
             elif today_matches:
-                msg = self.scheduler.format_daily_schedule(today_matches, current_matchday, is_next_day=False)
+                msg = self.scheduler.format_daily_schedule(
+                    today_matches, current_matchday, is_next_day=False
+                )
             else:
                 msg = f"📅 【HLTV 赛程预告】\n比赛日 {current_matchday} 及近期暂无大型焦点赛事安排。"
 
@@ -183,7 +206,9 @@ class Main(Star):
             score = m.get("score")
             score_str = ""
             if score and isinstance(score, dict):
-                score_str = f" [当前大比分 {score.get('team1', 0)} - {score.get('team2', 0)}]"
+                score_str = (
+                    f" [当前大比分 {score.get('team1', 0)} - {score.get('team2', 0)}]"
+                )
 
             url = m.get("url") or f"https://www.hltv.org/matches/{m_id}"
 
@@ -223,7 +248,7 @@ class Main(Star):
         # 按比赛日时区聚合
         by_matchday: Dict[str, List[Dict[str, Any]]] = {}
         for m in major_results:
-            ts = self.scheduler._parse_starts_at_ts(m)
+            ts = self.scheduler.parse_starts_at_ts(m)
             if ts:
                 m_day = self.scheduler.get_matchday(m, ts)
                 by_matchday.setdefault(m_day, []).append(m)
@@ -233,36 +258,53 @@ class Main(Star):
         # 检查今日比赛日是否有已完赛比赛
         if current_matchday in by_matchday and by_matchday[current_matchday]:
             today_matches = by_matchday[current_matchday]
-            today_matches.sort(key=lambda x: self.scheduler._parse_starts_at_ts(x) or 0, reverse=True)
-            msg = self.scheduler.format_matchday_results(today_matches, current_matchday, is_today=True)
+            today_matches.sort(
+                key=lambda x: self.scheduler.parse_starts_at_ts(x) or 0, reverse=True
+            )
+            msg = self.scheduler.format_matchday_results(
+                today_matches, current_matchday, is_today=True
+            )
         else:
             # 今日尚未有完赛比赛，展示最近的一个已完赛比赛日全部赛果
-            past_days = sorted([d for d in by_matchday.keys() if d <= current_matchday], reverse=True)
+            past_days = sorted(
+                [d for d in by_matchday.keys() if d <= current_matchday], reverse=True
+            )
             if past_days:
                 target_day = past_days[0]
                 day_matches = by_matchday[target_day]
-                day_matches.sort(key=lambda x: self.scheduler._parse_starts_at_ts(x) or 0, reverse=True)
+                day_matches.sort(
+                    key=lambda x: self.scheduler.parse_starts_at_ts(x) or 0,
+                    reverse=True,
+                )
 
                 # 提示今日首场开赛信息
                 hint = None
                 try:
                     upcoming = await self.client.get_upcoming_matches(days=1, limit=50)
                     today_upcoming = []
-                    tz = self.scheduler._get_tz()
+                    tz = self.scheduler.get_tz()
                     for m in upcoming:
                         if await self.scheduler.is_major_match(m):
-                            ts = self.scheduler._parse_starts_at_ts(m)
-                            if ts and self.scheduler.get_matchday(m, ts) == current_matchday:
+                            ts = self.scheduler.parse_starts_at_ts(m)
+                            if (
+                                ts
+                                and self.scheduler.get_matchday(m, ts)
+                                == current_matchday
+                            ):
                                 today_upcoming.append((ts, m))
                     if today_upcoming:
                         today_upcoming.sort(key=lambda x: x[0])
                         first_ts, first_m = today_upcoming[0]
-                        first_time_str = datetime.fromtimestamp(first_ts, tz=tz).strftime("%H:%M")
+                        first_time_str = datetime.fromtimestamp(
+                            first_ts, tz=tz
+                        ).strftime("%H:%M")
                         t1 = (first_m.get("team1") or {}).get("name") or "待定"
                         t2 = (first_m.get("team2") or {}).get("name") or "待定"
                         hint = f"今日焦点战尚未完赛，首场对决（{t1} vs {t2}）将于 {first_time_str} 开打。"
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(
+                        f"[HLTV] 获取今日首场比赛提示失败: {e}", exc_info=True
+                    )
 
                 msg = self.scheduler.format_matchday_results(
                     day_matches, target_day, is_today=False, next_match_hint=hint
@@ -319,8 +361,7 @@ class Main(Star):
 
         api_base = self.config.get("api_base", "https://hltv.rinyin.top")
         server_ip = self.config.get("server_ip", "x.x.x.x")
-        default_matchday_tz = self.config.get("default_matchday_timezone", self.config.get("matchday_timezone", "Europe/Berlin"))
-        tracked_tiers = self.config.get("tracked_tiers", ["T1", "T2"])
+        default_matchday_tz = self.config.get("matchday_timezone", "Europe/Berlin")
         daily_time = self.config.get("daily_schedule_time", "09:00")
         bo1_delay = self.config.get("bo1_delay_minutes", 45)
         bo3_delay = self.config.get("bo3_delay_minutes", 120)
@@ -333,7 +374,7 @@ class Main(Star):
             f"• 当前会话订阅：{'✅ 已订阅' if is_subbed else '❌ 未订阅'}\n"
             f"• 订阅会话总数：{len(targets)} 个\n"
             f"• API 服务地址：{api_base} (直连: {server_ip})\n"
-            f"• 赛事追踪级别：{'/'.join(tracked_tiers)} 级别赛事\n"
+            "• 赛事追踪级别：T1/T2 级别赛事\n"
             f"• 比赛日对齐时区：全球多赛区动态识别 (兜底: {default_matchday_tz})\n"
             f"• 每日赛程推送时间：{daily_time}\n"
             f"• 战报首次获取延迟：\n"
