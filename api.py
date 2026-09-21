@@ -1,7 +1,6 @@
 import asyncio
 import socket
-import time
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional
 
 import aiohttp
 from aiohttp.resolver import ThreadedResolver
@@ -51,8 +50,6 @@ class HLTVClient:
         self.timeout = timeout
         self.server_ip = server_ip
         self._session: Optional[aiohttp.ClientSession] = None
-        self._cached_top_teams: Set[str] = set()
-        self._top_teams_cached_at: float = 0.0
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -146,92 +143,40 @@ class HLTVClient:
             return data.get("match")
         return None
 
-    async def get_top_teams(self, max_age_seconds: float = 21600.0) -> Set[str]:
-        """获取当前 HLTV 世界排名前 30 的战队名称（小写集合，带缓存）"""
-        now = time.time()
-        if self._cached_top_teams and (
-            now - self._top_teams_cached_at < max_age_seconds
-        ):
-            return self._cached_top_teams
-
-        teams: Set[str] = set()
-        fallback_teams = {
-            "spirit",
-            "falcons",
-            "mouz",
-            "furia",
-            "vitality",
-            "legacy",
-            "fut",
-            "g2",
-            "aurora",
-            "natus vincere",
-            "navi",
-            "astralis",
-            "betboom",
-            "faze",
-            "9z",
-            "the mongolz",
-            "mongolz",
-            "b8",
-            "magic",
-            "mibr",
-            "parivision",
-            "gamerlegion",
-            "alliance",
-            "liquid",
-            "3dmax",
-            "inner circle",
-            "big",
-            "m80",
-            "pain",
-            "hotu",
-            "ninjas in pyjamas",
-            "nip",
-            "jijiehao",
-            "heroic",
-            "complexity",
-            "virtus.pro",
-            "vp",
-            "cloud9",
-            "ence",
-            "fnatic",
-            "saw",
-        }
-        teams.update(fallback_teams)
-
-        try:
-            data = await self._get("/api/v1/rankings/teams")
-            if data and isinstance(data, dict):
-                rankings = data.get("rankings") or data.get("teams") or []
-                for r in rankings:
-                    t_info = r.get("team") if isinstance(r, dict) else None
-                    if isinstance(t_info, dict):
-                        t_name = t_info.get("name")
-                        if t_name:
-                            teams.add(t_name.strip().lower())
-                    elif isinstance(r, dict) and "name" in r:
-                        teams.add(r["name"].strip().lower())
-            if teams:
-                self._cached_top_teams = teams
-                self._top_teams_cached_at = now
-                logger.debug(f"[HLTV] 成功更新世界排名战队缓存，共 {len(teams)} 支强队")
-        except Exception as e:
-            logger.warning(f"[HLTV] 拉取世界排名战队失败，使用保底名单: {e}")
-
-        return self._cached_top_teams or fallback_teams
-
     async def get_results(
-        self, days: Optional[int] = 7, limit: int = 100
+        self,
+        days: Optional[int] = 7,
+        limit: int = 100,
+        event_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """获取最近完赛结果"""
+        """获取最近完赛结果。传入 event_id 时仅返回该赛事的完赛记录（由上游按赛事过滤）"""
         params: Dict[str, Any] = {"limit": limit}
         if days is not None:
             params["days"] = days
+        if event_id:
+            params["event"] = str(event_id)
         data = await self._get("/api/v1/results", params=params)
         if data and isinstance(data, dict):
             return data.get("matches", [])
         return []
+
+    async def get_events(
+        self, status: str = "ongoing", limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """获取赛事列表。status: ongoing | upcoming | past | all"""
+        data = await self._get(
+            "/api/v1/events", params={"status": status, "limit": limit}
+        )
+        if data and isinstance(data, dict):
+            return data.get("events", [])
+        return []
+
+    async def get_event(self, event_id: str) -> Optional[Dict[str, Any]]:
+        """获取单个赛事详情（名称、日期、奖金池、参赛队等）"""
+        data = await self._get(f"/api/v1/events/{event_id}")
+        if data and isinstance(data, dict):
+            return data.get("event")
+        return None
 
     async def find_match(self, query: str) -> Optional[Dict[str, Any]]:
         """根据比赛ID或战队名称查找比赛详情"""

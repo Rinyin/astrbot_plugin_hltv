@@ -14,13 +14,13 @@
         "type": "string",
         "default": "Europe/Berlin"
     },
-    "min_stars": {
-        "description": "焦点赛事星级门槛 (用于辅助识别 T1/T2 赛事)",
-        "type": "int",
-        "default": 1
-    },
     "notify_targets": {
         "description": "提醒与赛程推送目标列表 (会话ID/群号，可通过 /hltv sub 快捷添加当前聊天)",
+        "type": "list",
+        "default": []
+    },
+    "tracked_events": {
+        "description": "手动标记的关注赛事 HLTV 赛事ID列表 (仅这些赛事会触发提醒、战报与每日赛程；可通过 /hltv track <ID> 添加)",
         "type": "list",
         "default": []
     },
