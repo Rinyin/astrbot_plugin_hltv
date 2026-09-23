@@ -940,6 +940,12 @@ class HLTVScheduler:
                     if m_day == current_matchday:
                         today_major_matches.append(m)
 
+            if not today_major_matches:
+                logger.info(
+                    f"[HLTV] 比赛日 {current_matchday} 关注赛事无比赛安排，跳过每日推送。"
+                )
+                return
+
             today_major_matches.sort(key=lambda x: self.parse_starts_at_ts(x) or 0)
             msg = self.format_daily_schedule(today_major_matches, current_matchday)
             await self.broadcast_message(msg)
