@@ -12,7 +12,7 @@
 4. **每日赛程推送** — 每天固定时间汇总当日关注赛事的比赛。
 5. **查询指令** — 今日赛程（打完自动切明日）、近期赛果、正在进行的比赛、任意比赛全场/单图数据。
 6. **全球赛区时区对齐** — 按比赛所在赛区/城市换算当地比赛日，北京时间深夜场与次日凌晨场归入同一比赛日；消息同时显示北京时间与当地时间。
-7. **网络直连** — 自定义解析器把 API 域名直接绑定到服务器 IP，规避本机代理 Fake-IP 导致的 TLS 失败。
+7. **可选直连** — 配置 `server_ip` 后，自定义解析器把 API 域名固定解析到该 IP，规避本机代理 Fake-IP 导致的 TLS 失败。
 
 ---
 
@@ -49,7 +49,7 @@
 | 配置项 | 类型 | 默认值 | 说明 |
 | :--- | :--- | :--- | :--- |
 | `api_base` | string | `https://hltv.rinyin.top` | HLTV API 地址 |
-| `server_ip` | string | `x.x.x.x` | API 服务器直连 IP |
+| `server_ip` | string | 空 | 可选，API 服务器直连 IP（绕过本机代理 Fake-IP / DNS 污染） |
 | `matchday_timezone` | string | `Europe/Berlin` | 无法识别赛区时的兜底比赛日时区 |
 | `notify_targets` | list | `[]` | 推送目标会话（`/hltv sub` 自动维护） |
 | `tracked_events` | list | `[]` | 关注赛事 ID（`/hltv track` 自动维护） |
@@ -81,4 +81,4 @@ astrbot_plugin_hltv/
 
 ## 上游 API 依赖
 
-插件依赖自建的 HLTV API（FastAPI，服务器 `~/hltv-api`）。本插件使用的端点：`/api/v1/matches`、`/api/v1/matches/{id}`、`/api/v1/results?event=`、`/api/v1/events`、`/api/v1/events/{id}`。
+插件依赖一个将 hltv.org 页面转为 JSON 的自建 HLTV API（FastAPI）。本插件使用的端点：`/api/v1/matches`、`/api/v1/matches/{id}`、`/api/v1/results?event=`、`/api/v1/events`、`/api/v1/events/{id}`。

@@ -15,7 +15,7 @@ PLUGIN_NAME = "astrbot_plugin_hltv"
     PLUGIN_NAME,
     "Rinyi",
     "HLTV CS2 关注赛事赛前10分钟提醒、赛后战报获取与每日赛程推送",
-    "1.2.0",
+    "1.3.0",
     "https://github.com/Rinyi/astrbot_plugin_hltv",
 )
 class HLTVPlugin(Star):
@@ -34,7 +34,7 @@ class HLTVPlugin(Star):
                 self.config[key] = []
 
         api_base = self.config.get("api_base", "https://hltv.rinyin.top")
-        server_ip = self.config.get("server_ip", "x.x.x.x")
+        server_ip = (self.config.get("server_ip") or "").strip()
         self.client = HLTVClient(base_url=api_base, server_ip=server_ip)
         self.scheduler = HLTVScheduler(
             context=self.context,
@@ -513,7 +513,7 @@ class HLTVPlugin(Star):
         is_subbed = origin in targets
 
         api_base = self.config.get("api_base", "https://hltv.rinyin.top")
-        server_ip = self.config.get("server_ip", "x.x.x.x")
+        server_ip = (self.config.get("server_ip") or "").strip()
         default_matchday_tz = self.config.get("matchday_timezone", "Europe/Berlin")
         daily_time = self.config.get("daily_schedule_time", "09:00")
         bo1_delay = self.config.get("bo1_delay_minutes", 45)

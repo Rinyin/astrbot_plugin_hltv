@@ -19,16 +19,14 @@
 
 - **API 接口地址**：`https://hltv.rinyin.top`
 - **API 在线文档**：`https://hltv.rinyin.top/docs`
-- **后端服务器基础设施**：
-  - 服务器直连 IP：`x.x.x.x`（SSH 账号与密钥路径不得写入仓库，仅保存在本地）
-- **上游 API 维护约定**：源码在服务器 `~/hltv-api`（无 git，改动前先 `tar` 备份到 `~/`），systemd 单元 `hltv-api.service`，改完 `sudo systemctl restart hltv-api`。插件依赖的上游行为：
+- **上游 API 契约**（插件依赖的行为）：
   - 比赛详情 `status` 依据页面 countdown（`Match over`/`LIVE`/倒计时）判定，不再因存在地图占位而误判为完赛。
   - `TBA` 地图占位不返回；未开赛比赛不返回选手数据；进行中比赛的大比分由已打完地图推算。
   - `format` 只返回 `boN`；弃权赛用 `forfeit: true` 表示。赛果列表带 `stars`（星数）。
   - `/api/v1/results?event=<ID>` 支持按赛事过滤，返回的比赛带 `event.id`。
 - **网络防污染与直连机制**：
   - Windows 环境下常存在 TUN/Clash 等代理软件接管流量（产生 Fake-IP，导致 TLS 握手异常或 DNS 污染）。
-  - 插件内置 `HostResolver`，将 `hltv.rinyin.top` 强行绑定直连至真实后端 IP `x.x.x.x`，并在发生网络抖动或超时（15s）时具备完善的容错处理。
+  - 插件内置 `HostResolver`；用户在配置 `server_ip` 后，将 API 域名固定解析到该 IP。默认留空，使用系统 DNS。请求超时 15s 并有容错处理。
 
 ---
 
@@ -125,7 +123,7 @@
 ## 7. 配置项规范 (`_conf_schema.json`)
 
 1. `api_base` (string): API 地址（默认 `https://hltv.rinyin.top`）
-2. `server_ip` (string): 直连 IP（默认 `x.x.x.x`）
+2. `server_ip` (string): 可选直连 IP（默认空）
 3. `matchday_timezone` (string): 兜底比赛日时区（默认 `Europe/Berlin`）
 4. `notify_targets` (list): 推送目标会话
 5. `tracked_events` (list): 关注赛事 ID 列表
@@ -143,7 +141,7 @@
 
 - **托管平台**：GitHub
 - **仓库地址**：`https://github.com/Rinyin/astrbot_plugin_hltv`
-- **私有属性要求（绝对约束）**：**必须为私有仓库（Private）**，禁止设为公开。
+- **公开仓库**：仓库为 Public。**严禁提交任何敏感信息**：服务器 IP、SSH 账号/密钥路径、部署路径、个人邮箱等一律不得出现在代码、文档或提交信息中。
 - **.gitignore 过滤项**：必须忽略 `__pycache__/`, `*.pyc`, `*.zip`, `*.log`, `.venv/` 等临时文件。运行状态文件不在插件目录内，无需忽略。
 
 ---

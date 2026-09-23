@@ -1,15 +1,12 @@
 import asyncio
 import socket
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import aiohttp
 from aiohttp.resolver import ThreadedResolver
 
 from astrbot.api import logger
-
-DEFAULT_HOST_MAP = {
-    "hltv.rinyin.top": "x.x.x.x",
-}
 
 
 class HostResolver(ThreadedResolver):
@@ -44,7 +41,7 @@ class HLTVClient:
         self,
         base_url: str = "https://hltv.rinyin.top",
         timeout: float = 15.0,
-        server_ip: Optional[str] = "x.x.x.x",
+        server_ip: Optional[str] = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
@@ -53,12 +50,15 @@ class HLTVClient:
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            host_map = dict(DEFAULT_HOST_MAP)
-            if self.server_ip:
-                host_map["hltv.rinyin.top"] = self.server_ip
+            # 可选：把 API 域名固定解析到用户配置的 IP，绕过本机代理的 Fake-IP / DNS 污染
+            host_map: Dict[str, str] = {}
+            api_host = urlparse(self.base_url).hostname
+            if self.server_ip and api_host:
+                host_map[api_host] = self.server_ip.strip()
 
-            resolver = HostResolver(host_map=host_map)
-            connector = aiohttp.TCPConnector(resolver=resolver)
+            connector = aiohttp.TCPConnector(
+                resolver=HostResolver(host_map=host_map) if host_map else None
+            )
             client_timeout = aiohttp.ClientTimeout(total=self.timeout)
 
             self._session = aiohttp.ClientSession(

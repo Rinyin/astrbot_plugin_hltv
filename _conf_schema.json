@@ -5,9 +5,9 @@
         "default": "https://hltv.rinyin.top"
     },
     "server_ip": {
-        "description": "API 服务器直连 IP (用于防 DNS 污染/假 IP，留空则使用默认系统 DNS)",
+        "description": "可选：API 服务器直连 IP，用于绕过本机代理 Fake-IP / DNS 污染；留空则使用系统 DNS",
         "type": "string",
-        "default": "x.x.x.x"
+        "default": ""
     },
     "matchday_timezone": {
         "description": "比赛日兜底时区 (系统优先根据比赛地区及城市动态识别当地时区；若无法识别时使用该兜底时区，默认 Europe/Berlin)",
