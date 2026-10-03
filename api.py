@@ -77,6 +77,37 @@ class HLTVClient:
             await self._session.close()
             self._session = None
 
+    async def get_asset(self, url: str, headers=None) -> tuple[bytes | None, dict]:
+        """Fetch an original image through the API server's persistent asset cache.
+
+        None means HTTP 304. Errors intentionally propagate so callers only
+        fall back to direct image downloads when an older API returns 404.
+        """
+        session = await self._get_session()
+        request_headers = {"Accept": "image/*"}
+        for name in ("If-None-Match", "If-Modified-Since"):
+            if headers and headers.get(name):
+                request_headers[name] = headers[name]
+        async with session.get(
+            f"{self.base_url}/api/v1/assets",
+            params={"url": url},
+            headers=request_headers,
+            timeout=aiohttp.ClientTimeout(total=min(self.timeout, 15)),
+        ) as response:
+            metadata = {
+                "ETag": response.headers.get("ETag"),
+                "Last-Modified": response.headers.get("Last-Modified"),
+            }
+            if response.status == 304:
+                return None, metadata
+            response.raise_for_status()
+            content = bytearray()
+            async for chunk in response.content.iter_chunked(65536):
+                content.extend(chunk)
+                if len(content) > 5 * 1024 * 1024:
+                    raise ValueError("Asset exceeds 5MB")
+            return bytes(content), metadata
+
     async def _get(
         self, endpoint: str, params: Optional[Dict[str, Any]] = None
     ) -> Optional[Dict[str, Any]]:

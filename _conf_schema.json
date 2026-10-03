@@ -73,5 +73,30 @@
         "description": "本地显示时区名称 (默认 Asia/Shanghai，即北京时间)",
         "type": "string",
         "default": "Asia/Shanghai"
+    },
+    "image_enabled": {
+        "description": "启用比赛消息图片；失败自动回退文本",
+        "type": "bool",
+        "default": true
+    },
+    "render_backend": {
+        "description": "渲染后端：auto 本地→T2I→文本；local 本地→文本；t2i T2I→文本",
+        "type": "string",
+        "default": "auto",
+        "options": [
+            "auto",
+            "local",
+            "t2i"
+        ]
+    },
+    "asset_refresh_days": {
+        "description": "素材后台检查更新间隔（天）；不作为删除期限，更新失败继续使用旧图",
+        "type": "int",
+        "default": 90
+    },
+    "asset_cache_max_mb": {
+        "description": "长期素材缓存容量上限（MB）；超限时按最近使用时间清理",
+        "type": "int",
+        "default": 1024
     }
 }

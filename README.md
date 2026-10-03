@@ -13,6 +13,41 @@
 5. **查询指令** — 今日赛程（打完自动切明日）、近期赛果、正在进行的比赛、任意比赛全场/单图数据。
 6. **全球赛区时区对齐** — 按比赛所在赛区/城市换算当地比赛日，北京时间深夜场与次日凌晨场归入同一比赛日；消息同时显示北京时间与当地时间。
 7. **可选直连** — 配置 `server_ip` 后，自定义解析器把 API 域名固定解析到该 IP，规避本机代理 Fake-IP 导致的 TLS 失败。
+8. **图片战报与海报** — 战报展示双方全员头像和统计；赛程按赛事分页，配合队标呈现对阵。比赛查询、自动战报、提醒和赛程共用图片输出，管理命令仍为文本。
+
+## 图片渲染与安装
+
+默认开启图片输出，自动依次尝试本地 Playwright/Chromium、AstrBot 的 `html_render` T2I 服务和文本。缺少浏览器或 T2I 不可用时仍可获取文本信息。`render_backend=local` 或 `t2i` 可指定图片后端，失败后回退文本；`image_enabled=false` 直接使用文本。
+
+在运行 AstrBot 的 Python 环境中，进入本插件目录安装依赖和浏览器：
+
+```bash
+python -m pip install -r requirements.txt
+python -m playwright install chromium
+```
+
+Linux 如提示浏览器缺少系统库，可按 Playwright 提示安装依赖。重载插件后使用 `/hltv match <比赛ID>` 或 `/hltv today` 验证图片。T2I 依赖 AstrBot 配置及渲染服务可用性；图片也需要平台适配器支持。
+
+模板随附 Noto Sans SC 中文字体，按 SIL Open Font License 使用，许可证见 `templates/fonts/OFL.txt`。
+
+队标、选手定妆照等素材长期保存，默认 **90 天检查更新**，这不是过期删除期限。更新时优先使用旧图，新图下载失败仍保留旧图；同一实体的素材 URL 变化会触发更新。默认素材缓存上限 **1GB**，超出容量后才按使用情况清理，避免每次发战报都重新下载。不完整素材使用占位图。成品战报与素材分开管理，待投递图片保留至任务结束，成功后的成品图片保留二十四小时。
+
+自动消息记录各目标、各页面的投递进度；重试和重启恢复只处理未成功部分。图片发送明确失败时尝试文本。重试间隔和次数沿用战报重试配置，失败任务可在 `/hltv status` 查看。平台无法确认的发送超时仍可能产生重复，不能保证严格的恰好一次投递。
+
+### 图片获取与本地素材
+
+插件优先通过同一个 `api_base` 的 `/api/v1/assets?url=<原始素材URL>` 获取图片，复用 API 服务器已有的 HLTV 会话；图片随后缓存在插件本地，模板只读取本地素材。HLTV 主站页面本身也引用图片 CDN，不能通过简单替换域名保证绕过 CDN。旧版 API 返回 404 时才尝试原始地址；临时服务失败时保留旧图，不反复访问被拦截的 CDN。
+
+如希望自行准备图片，可在插件数据目录放置以下文件（HLTV 数字 ID 可从比赛详情或对应主站页面取得）：
+
+```text
+data/plugin_data/astrbot_plugin_hltv/assets/local/
+├── team/11283.png       # 队标
+├── player/429.webp      # 选手照片
+└── event/8244.jpg       # 赛事背景或标志
+```
+
+支持 PNG、JPEG、WebP、SVG，单文件不超过 5MB。用户素材优先于 API 和自动缓存，不受 90 天更新及缓存容量清理影响；替换后下次渲染即生效。每个 ID 只保留一份图片。将 `assets/local/` 文件夹复制到另一台 AstrBot 的对应插件数据目录即可迁移，不需要复制配置、Cookie 或投递状态。自动缓存也使用相对文件名，可在停止插件后整体复制 `assets/`。
 
 ---
 
@@ -61,6 +96,10 @@
 | `daily_schedule_enabled` | bool | `true` | 每日赛程推送 |
 | `daily_schedule_time` | string | `09:00` | 推送时间（HH:MM） |
 | `timezone` | string | `Asia/Shanghai` | 显示时区 |
+| `image_enabled` | bool | `true` | 比赛消息使用图片，关闭后使用文本 |
+| `render_backend` | string | `auto` | `auto`：本地 → T2I → 文本；`local` / `t2i`：指定后端，失败转文本 |
+| `asset_refresh_days` | int | `90` | 素材检查更新周期，不是文件保留期限 |
+| `asset_cache_max_mb` | int | `1024` | 长期素材缓存容量上限（MB） |
 
 运行状态（已提醒/追踪中/赛事名缓存）保存在 `data/plugin_data/astrbot_plugin_hltv/state.json`。
 
@@ -73,6 +112,11 @@ astrbot_plugin_hltv/
 ├── main.py              # 插件入口：@register 的 Star 子类与 /hltv 指令组
 ├── scheduler.py         # 后台轮询：赛前提醒、战报追踪、每日推送；消息格式化
 ├── api.py               # 异步 API 客户端（IP 直连、错误处理）
+├── presentation.py      # 统一展示模型、分页及本地/T2I 渲染
+├── assets.py            # 长期素材缓存与后台更新
+├── delivery.py          # 持久化投递队列与分页重试
+├── templates/           # 图片模板及中文字体
+├── tests/               # 缓存、展示、命令及投递测试
 ├── _conf_schema.json    # WebUI 配置 Schema
 ├── metadata.yaml        # 插件元数据
 ├── requirements.txt     # 依赖
@@ -81,4 +125,4 @@ astrbot_plugin_hltv/
 
 ## 上游 API 依赖
 
-插件依赖一个将 hltv.org 页面转为 JSON 的自建 HLTV API（FastAPI）。本插件使用的端点：`/api/v1/matches`、`/api/v1/matches/{id}`、`/api/v1/results?event=`、`/api/v1/events`、`/api/v1/events/{id}`。
+插件依赖一个将 hltv.org 页面转为 JSON 的自建 HLTV API（FastAPI）。本插件使用的端点：`/api/v1/matches`、`/api/v1/matches/{id}`、`/api/v1/results?event=`、`/api/v1/events`、`/api/v1/events/{id}`，以及返回图片字节的 `/api/v1/assets?url=`。

@@ -11,6 +11,7 @@ from astrbot.api.event import MessageChain
 from astrbot.api.star import Context, StarTools
 
 from .api import HLTVClient
+from .delivery import DeliveryQueue
 
 # 全球常见赛区与城市时区映射表（用于按比赛当地真实时区动态划分比赛日）
 REGION_TIMEZONES: Dict[str, str] = {
@@ -131,6 +132,8 @@ class HLTVScheduler:
         self.tracking_matches: Dict[str, Dict[str, Any]] = {}
         self.reported_match_ids: Set[str] = set()
         self.last_daily_date: Optional[str] = None
+        self._daily_retry_date: Optional[str] = None
+        self._daily_retry_at = 0.0
 
         # 已标记赛事的名称缓存 {event_id: name}，用于在消息中显示赛事名
         self.event_names: Dict[str, str] = {}
@@ -140,6 +143,14 @@ class HLTVScheduler:
         self.state_file_path = os.path.join(str(data_dir), "state.json")
 
         self._load_state()
+        self.presentation = None
+        self.delivery = DeliveryQueue(
+            os.path.join(str(data_dir), "delivery.json"),
+            config,
+            self._build_pages,
+            self._send_page,
+            self._delivery_complete,
+        )
 
     def get_tz(self) -> ZoneInfo:
         """用户显示时区（默认 Asia/Shanghai，即北京时间）"""
@@ -263,8 +274,9 @@ class HLTVScheduler:
                 "last_daily_date": self.last_daily_date,
                 "event_names": self.event_names,
             }
-            with open(self.state_file_path, "w", encoding="utf-8") as f:
+            with open(self.state_file_path + ".tmp", "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(self.state_file_path + ".tmp", self.state_file_path)
         except Exception as e:
             logger.error(f"[HLTV] 保存状态文件失败: {e}", exc_info=True)
 
@@ -273,6 +285,7 @@ class HLTVScheduler:
         if self._running:
             return
         self._running = True
+        self.delivery.start()
         self._task = asyncio.create_task(self._loop())
         logger.info("[HLTV] 后台调度轮询任务已启动。")
 
@@ -287,21 +300,70 @@ class HLTVScheduler:
                 pass
             self._task = None
         self._save_state()
+        await self.delivery.stop()
         logger.info("[HLTV] 后台调度轮询任务已停止。")
 
-    async def broadcast_message(self, text: str) -> None:
-        """向所有已订阅的目标广播消息"""
-        targets: List[str] = self.config.get("notify_targets", [])
-        if not targets:
-            logger.debug("[HLTV] 未配置 notify_targets，跳过广播消息。")
-            return
+    @property
+    def delivery_status(self):
+        return self.delivery.status
 
-        for target in targets:
+    def _delivery_complete(self, key):
+        kind, identifier = key.split(":", 1)
+        changed = False
+        if kind == "reminder" and identifier not in self.reminded_match_ids:
+            self.reminded_match_ids.add(identifier)
+            changed = True
+        elif kind == "report" and identifier not in self.reported_match_ids:
+            self.reported_match_ids.add(identifier)
+            self.tracking_matches.pop(identifier, None)
+            changed = True
+        elif kind == "daily" and (self.last_daily_date or "") < identifier:
+            self.last_daily_date = identifier
+            changed = True
+        if changed:
+            self._save_state()
+
+    async def _build_pages(self, **payload):
+        if self.presentation is not None:
+            return await self.presentation.build(**payload)
+        return [{"text": payload["text"], "image": None}]
+
+    async def _send_page(self, target, page):
+        if page.get("image") and os.path.isfile(page["image"]):
             try:
-                await self.context.send_message(target, MessageChain().message(text))
-                await asyncio.sleep(0.3)  # 限速保护
-            except Exception as e:
-                logger.error(f"[HLTV] 向目标 {target} 发送消息失败: {e}", exc_info=True)
+                chain = MessageChain().file_image(page["image"])
+                if page.get("caption"):
+                    chain.message(page["caption"])
+                result = await self.context.send_message(target, chain)
+                if result is not False:
+                    return True
+            except TimeoutError:
+                # Outcome is uncertain: do not immediately duplicate as text.
+                return False
+            except Exception:
+                logger.exception("[HLTV] 图片投递失败，尝试文本")
+        result = await self.context.send_message(
+            target, MessageChain().message(page["text"])
+        )
+        await asyncio.sleep(0.3)
+        return result is not False
+
+    async def broadcast_message(self, text: str):
+        results = {}
+        for target in self.config.get("notify_targets", []):
+            try:
+                results[target] = await self._send_page(target, {"text": text})
+            except Exception:
+                logger.exception("[HLTV] 广播投递失败")
+                results[target] = False
+        return results
+
+    def _enqueue(self, key, kind, matches, text, title=""):
+        return self.delivery.enqueue(
+            key,
+            {"kind": kind, "matches": matches, "text": text, "title": title},
+            self.config.get("notify_targets", []),
+        )
 
     def parse_starts_at_ts(self, match: Dict[str, Any]) -> Optional[float]:
         """解析比赛开始时间戳（秒）"""
@@ -915,18 +977,29 @@ class HLTVScheduler:
         target_time = self.config.get("daily_schedule_time", "09:00").strip()
         current_hm = now.strftime("%H:%M")
         current_matchday = self.get_current_matchday()
+        if self._daily_retry_date != current_matchday:
+            self._daily_retry_date = current_matchday
+            self._daily_retry_at = 0.0
 
-        if current_hm == target_time and self.last_daily_date != current_matchday:
+        if (
+            current_hm >= target_time
+            and self.last_daily_date != current_matchday
+            and f"daily:{current_matchday}" not in self.delivery.jobs
+            and now.timestamp() >= self._daily_retry_at
+        ):
             logger.info(
                 f"[HLTV] 触发每日赛程定时推送: 比赛日 {current_matchday} {current_hm}"
             )
-            self.last_daily_date = current_matchday
-            self._save_state()
-
             if not self.get_tracked_event_ids():
                 logger.info("[HLTV] 未标记任何赛事，跳过每日赛程推送。")
                 return
 
+            # Record before fetching: errors and empty results retry later today,
+            # including when the configured minute has already passed.
+            self._daily_retry_at = (
+                now.timestamp()
+                + max(1, int(self.config.get("result_retry_interval", 10))) * 60
+            )
             # 查询未来比赛并按比赛日聚合
             upcoming = await self.client.get_upcoming_matches(days=3, limit=300)
             today_major_matches: List[Dict[str, Any]] = []
@@ -948,7 +1021,13 @@ class HLTVScheduler:
 
             today_major_matches.sort(key=lambda x: self.parse_starts_at_ts(x) or 0)
             msg = self.format_daily_schedule(today_major_matches, current_matchday)
-            await self.broadcast_message(msg)
+            self._enqueue(
+                f"daily:{current_matchday}",
+                "schedule",
+                today_major_matches,
+                msg,
+                title=f"比赛日 {current_matchday}",
+            )
 
     async def check_match_reminders(self, now_ts: float) -> None:
         """检查未来 10 分钟内即将开赛的已标记赛事比赛并发送提醒"""
@@ -973,15 +1052,19 @@ class HLTVScheduler:
 
             # 赛前 10 分钟提醒区间：0 秒至 600 秒（10分钟）
             if 0 <= time_diff <= 600:
-                if match_id not in self.reminded_match_ids:
-                    self.reminded_match_ids.add(match_id)
+                if (
+                    match_id not in self.reminded_match_ids
+                    and f"reminder:{match_id}" not in self.delivery.jobs
+                ):
                     logger.info(
                         f"[HLTV] 触发赛前10分钟提醒: 比赛ID {match_id} 即将在 {time_diff:.0f}s 后开赛"
                     )
 
                     if reminder_enabled:
                         msg = self.format_match_reminder(match)
-                        await self.broadcast_message(msg)
+                        self._enqueue(f"reminder:{match_id}", "reminder", [match], msg)
+                    else:
+                        self.reminded_match_ids.add(match_id)
 
                     # 自动加入赛后战报追踪队列
                     self._register_tracking_match(match, starts_ts, now_ts)
@@ -1035,6 +1118,8 @@ class HLTVScheduler:
         match_ids = list(self.tracking_matches.keys())
 
         for match_id in match_ids:
+            if f"report:{match_id}" in self.delivery.jobs:
+                continue
             info = self.tracking_matches.get(match_id)
             if not info:
                 continue
@@ -1058,10 +1143,11 @@ class HLTVScheduler:
                 logger.info(f"[HLTV] 比赛 {match_id} 已完赛，生成并推送战报！")
                 if report_enabled:
                     msg = self.format_match_result(detail)
-                    await self.broadcast_message(msg)
-
-                self.reported_match_ids.add(match_id)
-                self.tracking_matches.pop(match_id, None)
+                    if not self._enqueue(f"report:{match_id}", "match", [detail], msg):
+                        info["next_check_ts"] = now_ts + retry_interval_min * 60
+                else:
+                    self.reported_match_ids.add(match_id)
+                    self.tracking_matches.pop(match_id, None)
                 self._save_state()
             else:
                 retry_count = info.get("retry_count", 0) + 1

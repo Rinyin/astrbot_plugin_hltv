@@ -3,10 +3,11 @@ from typing import Any, Dict, List, Optional
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star, StarTools, register
 
 from .api import HLTVClient
 from .scheduler import HLTVScheduler
+from .presentation import PresentationService
 
 PLUGIN_NAME = "astrbot_plugin_hltv"
 
@@ -15,7 +16,7 @@ PLUGIN_NAME = "astrbot_plugin_hltv"
     PLUGIN_NAME,
     "Rinyi",
     "HLTV CS2 关注赛事赛前10分钟提醒、赛后战报获取与每日赛程推送",
-    "1.3.0",
+    "1.4.1",
     "https://github.com/Rinyi/astrbot_plugin_hltv",
 )
 class HLTVPlugin(Star):
@@ -42,6 +43,14 @@ class HLTVPlugin(Star):
             client=self.client,
             plugin_name=PLUGIN_NAME,
         )
+        self.presentation = PresentationService(
+            config=self.config,
+            data_dir=StarTools.get_data_dir(PLUGIN_NAME),
+            html_render=self.html_render,
+            client=self.client,
+            scheduler=self.scheduler,
+        )
+        self.scheduler.presentation = self.presentation
 
     async def initialize(self):
         """当插件被载入或启动时调用"""
@@ -50,8 +59,15 @@ class HLTVPlugin(Star):
 
     async def terminate(self):
         """当插件被禁用或重载时调用"""
-        await self.scheduler.stop()
-        await self.client.close()
+        for name, close in (
+            ("调度器", self.scheduler.stop),
+            ("图片服务", self.presentation.close),
+            ("API 客户端", self.client.close),
+        ):
+            try:
+                await close()
+            except Exception:
+                logger.warning("[HLTV] 关闭%s失败", name, exc_info=True)
         logger.info("[HLTV] HLTV 赛事推送插件已终止。")
 
     def _save_config(self):
@@ -64,6 +80,31 @@ class HLTVPlugin(Star):
     # ------------------------------------------------------------------
     # 内部辅助
     # ------------------------------------------------------------------
+
+    async def _send_presentation(self, event, kind, matches, text, **kwargs):
+        """Send pages directly so an adapter image failure can fall back to text."""
+        pages = await self.presentation.build(kind, matches, text, **kwargs)
+        for page in pages:
+            if page.get("image"):
+                try:
+                    from astrbot.api.message_components import Image, Plain
+
+                    chain = [Image.fromFileSystem(page["image"])]
+                    if page.get("caption"):
+                        chain.append(Plain(page["caption"]))
+                    result = await event.send(event.chain_result(chain))
+                    if result is False:
+                        raise RuntimeError("adapter rejected image")
+                    continue
+                except TimeoutError:
+                    logger.warning(
+                        "[HLTV] 图片回复超时，投递结果未知，避免立即重复回复",
+                        exc_info=True,
+                    )
+                    return
+                except Exception:
+                    logger.warning("[HLTV] 图片回复失败，回退文本", exc_info=True)
+            await event.send(event.plain_result(page["text"]))
 
     async def _collect_tracked_matches(
         self, days: int = 5
@@ -309,7 +350,12 @@ class HLTVPlugin(Star):
         msg = self.scheduler.format_match_detail(
             detail, map_query=map_arg.strip() if map_arg else None
         )
-        yield event.plain_result(msg)
+        if msg.startswith("⚠️"):
+            yield event.plain_result(msg)
+            return
+        await self._send_presentation(
+            event, "match", [detail], msg, map_name=map_arg.strip() or None
+        )
 
     @hltv.command("today", alias={"赛程", "今日赛程"})
     async def hltv_today(self, event: AstrMessageEvent):
@@ -323,6 +369,7 @@ class HLTVPlugin(Star):
         by_matchday = await self._collect_tracked_matches(days=5)
         current_matchday = self.scheduler.get_current_matchday()
         today_matches = by_matchday.get(current_matchday, [])
+        selected_matches = today_matches
 
         has_active = any(m.get("status") in ("upcoming", "live") for m in today_matches)
 
@@ -334,6 +381,7 @@ class HLTVPlugin(Star):
             future_days = sorted(d for d in by_matchday if d > current_matchday)
             if future_days:
                 next_day = future_days[0]
+                selected_matches = by_matchday[next_day]
                 msg = self.scheduler.format_daily_schedule(
                     by_matchday[next_day], next_day, is_next_day=True
                 )
@@ -347,7 +395,9 @@ class HLTVPlugin(Star):
                     "已标记的赛事没有比赛安排。"
                 )
 
-        yield event.plain_result(msg)
+        await self._send_presentation(
+            event, "schedule", selected_matches, msg, title=msg.splitlines()[0]
+        )
 
     @hltv.command("live", alias={"正在进行", "实时"})
     async def hltv_live(self, event: AstrMessageEvent):
@@ -384,7 +434,7 @@ class HLTVPlugin(Star):
             lines.pop()
         lines.append("------------------------------------")
         lines.append("💡 发送 /hltv match <ID或战队> 查看全员KDA与Rating")
-        yield event.plain_result("\n".join(lines))
+        await self._send_presentation(event, "live", live_matches, "\n".join(lines))
 
     @hltv.command("results", alias={"战报", "最近战报", "最近赛果"})
     async def hltv_results(self, event: AstrMessageEvent):
@@ -410,6 +460,7 @@ class HLTVPlugin(Star):
 
         if by_matchday.get(current_matchday):
             today_matches = by_matchday[current_matchday]
+            selected_results = today_matches
             today_matches.sort(
                 key=lambda x: self.scheduler.parse_starts_at_ts(x) or 0, reverse=True
             )
@@ -426,6 +477,7 @@ class HLTVPlugin(Star):
 
             target_day = past_days[0]
             day_matches = by_matchday[target_day]
+            selected_results = day_matches
             day_matches.sort(
                 key=lambda x: self.scheduler.parse_starts_at_ts(x) or 0, reverse=True
             )
@@ -455,7 +507,9 @@ class HLTVPlugin(Star):
                 day_matches, target_day, is_today=False, next_match_hint=hint
             )
 
-        yield event.plain_result(msg)
+        await self._send_presentation(
+            event, "results", selected_results, msg, title=msg.splitlines()[0]
+        )
 
     # ---------------- 订阅 ----------------
 
@@ -520,6 +574,7 @@ class HLTVPlugin(Star):
         bo3_delay = self.config.get("bo3_delay_minutes", 120)
         bo5_delay = self.config.get("bo5_delay_minutes", 240)
         retry_interval = self.config.get("result_retry_interval", 10)
+        delivery = self.scheduler.delivery_status
 
         tracked_lines = (
             "\n".join(
@@ -546,6 +601,12 @@ class HLTVPlugin(Star):
             f"• 战报未完赛重试间隔：每 {retry_interval} 分钟\n"
             f"• 当前追踪中比赛数：{len(self.scheduler.tracking_matches)} 场\n"
             f"• 历史已提醒比赛数：{len(self.scheduler.reminded_match_ids)} 场\n"
+            f"• 图片输出：{'开启' if self.config.get('image_enabled', True) else '关闭'}"
+            f" / 后端：{self.config.get('render_backend', 'auto')}\n"
+            f"• 素材更新检查：{self.config.get('asset_refresh_days', 90)} 天"
+            f" / 容量：{self.config.get('asset_cache_max_mb', 1024)} MB\n"
+            f"• 待投递任务：{delivery['pending']} / 失败任务：{delivery['failed']}"
+            f" / 已取消：{delivery.get('cancelled', 0)}\n"
             "------------------------------------\n"
             "💡 /hltv sub 或 /hltv unsub 管理订阅；/hltv track 或 /hltv untrack 管理关注赛事"
         )
