@@ -16,7 +16,7 @@ PLUGIN_NAME = "astrbot_plugin_hltv"
     PLUGIN_NAME,
     "Rinyi",
     "HLTV CS2 关注赛事赛前10分钟提醒、赛后战报获取与每日赛程推送",
-    "1.4.1",
+    "1.4.2",
     "https://github.com/Rinyi/astrbot_plugin_hltv",
 )
 class HLTVPlugin(Star):
@@ -83,8 +83,7 @@ class HLTVPlugin(Star):
 
     async def _send_presentation(self, event, kind, matches, text, **kwargs):
         """Send pages directly so an adapter image failure can fall back to text."""
-        pages = await self.presentation.build(kind, matches, text, **kwargs)
-        for page in pages:
+        async for page in self.presentation.iter_pages(kind, matches, text, **kwargs):
             if page.get("image"):
                 try:
                     from astrbot.api.message_components import Image, Plain
@@ -110,7 +109,7 @@ class HLTVPlugin(Star):
         self, days: int = 5
     ) -> Dict[str, List[Dict[str, Any]]]:
         """拉取未来 N 天赛程，仅保留已标记赛事，按当地比赛日聚合"""
-        all_matches = await self.client.get_matches(status="all", days=days, limit=300)
+        all_matches = await self.scheduler.fetch_schedule_matches(days=days)
         by_matchday: Dict[str, List[Dict[str, Any]]] = {}
         for m in all_matches:
             if not self.scheduler.is_tracked_match(m):
@@ -118,6 +117,8 @@ class HLTVPlugin(Star):
             ts = self.scheduler.parse_starts_at_ts(m)
             if ts:
                 by_matchday.setdefault(self.scheduler.get_matchday(m, ts), []).append(m)
+            elif m.get("status") == "live":
+                by_matchday.setdefault("", []).append(m)
         for day_matches in by_matchday.values():
             day_matches.sort(key=lambda x: self.scheduler.parse_starts_at_ts(x) or 0)
         return by_matchday
@@ -367,33 +368,17 @@ class HLTVPlugin(Star):
             return
 
         by_matchday = await self._collect_tracked_matches(days=5)
-        current_matchday = self.scheduler.get_current_matchday()
-        today_matches = by_matchday.get(current_matchday, [])
-        selected_matches = today_matches
-
-        has_active = any(m.get("status") in ("upcoming", "live") for m in today_matches)
-
-        if today_matches and has_active:
-            msg = self.scheduler.format_daily_schedule(
-                today_matches, current_matchday, is_next_day=False
-            )
-        else:
-            future_days = sorted(d for d in by_matchday if d > current_matchday)
-            if future_days:
-                next_day = future_days[0]
-                selected_matches = by_matchday[next_day]
-                msg = self.scheduler.format_daily_schedule(
-                    by_matchday[next_day], next_day, is_next_day=True
-                )
-            elif today_matches:
-                msg = self.scheduler.format_daily_schedule(
-                    today_matches, current_matchday, is_next_day=False
-                )
-            else:
-                msg = (
-                    f"📅 【HLTV 赛程预告】\n比赛日 {current_matchday} 及近期，"
-                    "已标记的赛事没有比赛安排。"
-                )
+        selected_matches = self.scheduler.select_schedule_matches(
+            [m for day_matches in by_matchday.values() for m in day_matches]
+        )
+        selected_days = sorted(
+            day
+            for day, matches in by_matchday.items()
+            if day and any(m in selected_matches for m in matches)
+        )
+        msg = self.scheduler.format_daily_schedule(
+            selected_matches, " / ".join(selected_days) or "按赛事当地日期"
+        )
 
         await self._send_presentation(
             event, "schedule", selected_matches, msg, title=msg.splitlines()[0]

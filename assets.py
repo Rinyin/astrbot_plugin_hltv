@@ -134,7 +134,12 @@ class AssetCache:
             return result
         return None
 
-    async def get(self, kind, entity_id, url):
+    async def get(self, kind, entity_id, url, *, wait=True):
+        """Return a cached image; optionally wait for a first download.
+
+        Interactive rendering uses wait=False so a cold CDN cannot hold a
+        reply open. Downloads remain tracked and continue filling the cache.
+        """
         if self._closing:
             return None
         local = await asyncio.to_thread(self._local_override, kind, entity_id)
@@ -169,7 +174,7 @@ class AssetCache:
             task = asyncio.create_task(self._refresh(key, url))
             self._tasks[key] = task
             task.add_done_callback(lambda done, k=key: self._tasks.pop(k, None))
-        if cached:
+        if cached or not wait:
             return cached
         # Shield the download so a page's five-second asset budget does not cancel it.
         await asyncio.shield(task)

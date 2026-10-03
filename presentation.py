@@ -71,6 +71,7 @@ class PresentationService:
         self._cooldown = 0
         self._failures = 0
         self._event_cache = {}
+        self._event_tasks = {}
         self._fonts = OrderedDict()
         self._build_tasks = set()
         self._closing = False
@@ -206,7 +207,7 @@ class PresentationService:
 
     async def _enrich(self, models, matches):
         async def assign(target, field, kind, identity, url):
-            target[field] = await self.assets.get(kind, identity, url)
+            target[field] = await self.assets.get(kind, identity, url, wait=False)
 
         calls = []
         for model, match in zip(models, matches):
@@ -235,14 +236,37 @@ class PresentationService:
         if event_id and not event.get("header_image"):
             cached = self._event_cache.get(event_id)
             if not cached or time.time() - cached[0] > 86400:
-                fetched = await self.client.get_event(event_id)
-                details = fetched or event
-                self._event_cache[event_id] = (time.time(), details)
-            else:
+                if event_id not in self._event_tasks and not self._closing:
+                    task = asyncio.create_task(self._refresh_event(event_id, event))
+                    self._event_tasks[event_id] = task
+                    task.add_done_callback(
+                        lambda done, key=event_id: self._event_tasks.pop(key, None)
+                    )
+            if cached:
                 details = cached[1]
         return await self.assets.get(
-            "event", event_id, details.get("header_image") or details.get("logo")
+            "event",
+            event_id,
+            details.get("header_image") or details.get("logo"),
+            wait=False,
         )
+
+    async def _refresh_event(self, event_id, event):
+        try:
+            fetched = await self.client.get_event(event_id)
+            details = fetched or event
+            self._event_cache[event_id] = (time.time(), details)
+            await self.assets.get(
+                "event",
+                event_id,
+                details.get("header_image") or details.get("logo"),
+                wait=False,
+            )
+        except Exception:
+            # Event decoration is optional; failed requests must not delay replies
+            # or be retried on every page.
+            self._event_cache[event_id] = (time.time() - 86400 + 300, event)
+            logger.debug("[HLTV] 赛事背景预取失败: %s", event_id, exc_info=True)
 
     def render_html(self, models, title, kind, background=None, page=1, pages=1):
         template = self.environment.get_template("card.html")
@@ -443,9 +467,22 @@ class PresentationService:
             self._build_tasks.discard(task)
 
     async def _build(self, kind, matches, text, *, title="", map_name=None):
+        return [
+            page
+            async for page in self.iter_pages(
+                kind, matches, text, title=title, map_name=map_name
+            )
+        ]
+
+    async def iter_pages(self, kind, matches, text, *, title="", map_name=None):
+        """Render replies incrementally; scheduled delivery can still collect build()."""
+        if self._closing:
+            yield {"text": text, "caption": "", "image": None}
+            return
         await asyncio.to_thread(self.cleanup_rendered)
         if not matches or not self.config.get("image_enabled", True):
-            return [{"text": text, "caption": "", "image": None}]
+            yield {"text": text, "caption": "", "image": None}
+            return
         groups = OrderedDict()
         for match in matches:
             event = match.get("event") or {}
@@ -456,23 +493,27 @@ class PresentationService:
             for items in groups.values()
             for i in range(0, len(items), 1 if kind in {"match", "reminder"} else 6)
         ]
-        output = []
         for index, batch in enumerate(batches, 1):
+            if self._closing:
+                return
             fallback = (
                 text
                 if len(batches) == 1
                 else self._fallback(kind, batch, text, title, map_name)
             )
             page = {"text": fallback, "caption": "", "image": None}
-            try:
-                await asyncio.wait_for(
-                    self._build_page(
-                        kind, batch, page, title, map_name, index, len(batches)
-                    ),
-                    timeout=40,
+            task = asyncio.create_task(
+                self._build_page(
+                    kind, batch, page, title, map_name, index, len(batches)
                 )
+            )
+            self._build_tasks.add(task)
+            try:
+                await asyncio.wait_for(task, timeout=40)
             except Exception:
                 logger.warning("[HLTV] 图片页面准备失败，使用文本", exc_info=True)
+            finally:
+                self._build_tasks.discard(task)
             if index == len(batches):
                 hints = "\n".join(
                     line for line in text.splitlines() if line.startswith("💡")
@@ -481,12 +522,11 @@ class PresentationService:
                     page["caption"] += "\n" + hints
                     if len(batches) > 1:
                         page["text"] += "\n" + hints
-            output.append(page)
-        return output
+            yield page
 
     async def close(self):
         self._closing = True
-        tasks = list(self._build_tasks)
+        tasks = list(self._build_tasks) + list(self._event_tasks.values())
         for task in tasks:
             task.cancel()
         if tasks:

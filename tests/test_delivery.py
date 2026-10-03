@@ -62,6 +62,8 @@ class DailyRetryTests(unittest.IsolatedAsyncioTestCase):
         scheduler._daily_retry_at = 0
         scheduler.delivery = types.SimpleNamespace(jobs={})
         scheduler.client = types.SimpleNamespace(get_upcoming_matches=AsyncMock())
+        scheduler.fetch_schedule_matches = scheduler.client.get_upcoming_matches
+        scheduler.select_schedule_matches = lambda matches, now: matches
         scheduler.get_current_matchday = Mock(return_value="2026-10-03")
         scheduler.get_tracked_event_ids = Mock(return_value=["1"])
         scheduler.is_tracked_match = Mock(return_value=True)

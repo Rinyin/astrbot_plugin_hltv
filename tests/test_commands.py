@@ -4,8 +4,10 @@ import importlib
 import logging
 import sys
 from pathlib import Path
+from datetime import datetime
 from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -93,6 +95,18 @@ def plugin(plugin_class):
         format_match_detail=lambda detail, **kwargs: "Match details",
         parse_starts_at_ts=lambda match: match.get("timestamp", 1),
         get_matchday=lambda match, ts: match["day"],
+        get_match_timezone=lambda match: ZoneInfo("Europe/Berlin"),
+        is_tracked_match=lambda match: True,
+    )
+    scheduler_class = sys.modules[
+        plugin_class.__module__.rsplit(".", 1)[0] + ".scheduler"
+    ].HLTVScheduler
+    instance.scheduler.select_schedule_matches = lambda matches: (
+        scheduler_class.select_schedule_matches(
+            instance.scheduler,
+            matches,
+            datetime(2026, 10, 3, 12, tzinfo=ZoneInfo("UTC")),
+        )
     )
     instance.client = SimpleNamespace()
     instance._send_presentation = AsyncMock()
@@ -111,10 +125,18 @@ async def consume(handler):
     return [response async for response in handler]
 
 
+def presentation(pages):
+    async def iter_pages(*args, **kwargs):
+        for page in pages:
+            yield page
+
+    return SimpleNamespace(iter_pages=iter_pages)
+
+
 @pytest.mark.asyncio
 async def test_today_renders_selected_future_day(plugin):
-    past = [{"id": 1, "status": "finished"}]
-    future = [{"id": 2, "status": "upcoming"}]
+    past = [{"id": 1, "status": "finished", "day": "2026-10-03"}]
+    future = [{"id": 2, "status": "upcoming", "day": "2026-10-04"}]
     plugin._collect_tracked_matches = AsyncMock(
         return_value={"2026-10-03": past, "2026-10-04": future}
     )
@@ -122,6 +144,63 @@ async def test_today_renders_selected_future_day(plugin):
     call = plugin._send_presentation.call_args
     assert call.args[1:3] == ("schedule", future)
     assert "2026-10-04" in call.args[3]
+
+
+@pytest.mark.asyncio
+async def test_today_keeps_live_from_previous_matchday(plugin):
+    live = {"id": 3, "status": "live", "day": "2026-10-02"}
+    plugin._collect_tracked_matches = AsyncMock(return_value={"2026-10-02": [live]})
+    await consume(plugin.hltv_today(event()))
+    assert plugin._send_presentation.call_args.args[2] == [live]
+
+
+def test_schedule_uses_each_events_local_day(plugin_class):
+    scheduler_class = sys.modules[
+        plugin_class.__module__.rsplit(".", 1)[0] + ".scheduler"
+    ].HLTVScheduler
+    scheduler = scheduler_class.__new__(scheduler_class)
+    scheduler.config = {"tracked_events": ["1", "2"]}
+    scheduler.is_tracked_match = lambda match: True
+    scheduler.get_match_timezone = lambda match: ZoneInfo(match["zone"])
+    # Beijing has reached October 4 while Berlin is still October 3.
+    now = datetime(2026, 10, 3, 17, tzinfo=ZoneInfo("UTC"))
+    berlin = {
+        "id": 1,
+        "event": {"id": 1},
+        "zone": "Europe/Berlin",
+        "status": "upcoming",
+        "starts_at": "2026-10-03T20:00:00Z",
+    }
+    sydney = {
+        "id": 2,
+        "event": {"id": 2},
+        "zone": "Australia/Sydney",
+        "status": "upcoming",
+        "starts_at": "2026-10-04T01:00:00Z",
+    }
+    old_live = {
+        "id": 3,
+        "event": {"id": 1},
+        "zone": "Europe/Berlin",
+        "status": "live",
+        "starts_at": "2026-10-02T21:00:00Z",
+    }
+    unknown_live = {
+        "id": 4,
+        "event": {"id": 1},
+        "zone": "Europe/Berlin",
+        "status": "live",
+    }
+    assert scheduler.select_schedule_matches(
+        [berlin, sydney, old_live, unknown_live, old_live], now
+    ) == [unknown_live, old_live, berlin, sydney]
+
+
+@pytest.mark.asyncio
+async def test_collect_keeps_live_without_start_timestamp(plugin):
+    live = {"id": 3, "status": "live", "timestamp": None}
+    plugin.scheduler.fetch_schedule_matches = AsyncMock(return_value=[live])
+    assert await plugin._collect_tracked_matches() == {"": [live]}
 
 
 @pytest.mark.asyncio
@@ -160,13 +239,11 @@ async def test_invalid_map_stays_text(plugin):
 @pytest.mark.parametrize("failure", [False, RuntimeError("adapter rejected")])
 async def test_image_send_failure_falls_back_for_that_page(plugin_class, failure):
     plugin = plugin_class.__new__(plugin_class)
-    plugin.presentation = SimpleNamespace(
-        build=AsyncMock(
-            return_value=[
-                {"image": "card.png", "caption": "summary", "text": "full stats"},
-                {"image": None, "text": "page two"},
-            ]
-        )
+    plugin.presentation = presentation(
+        [
+            {"image": "card.png", "caption": "summary", "text": "full stats"},
+            {"image": None, "text": "page two"},
+        ]
     )
     target = event()
     target.send.side_effect = [failure, None, None]
@@ -178,9 +255,7 @@ async def test_image_send_failure_falls_back_for_that_page(plugin_class, failure
 @pytest.mark.asyncio
 async def test_image_success_does_not_duplicate_text(plugin_class):
     plugin = plugin_class.__new__(plugin_class)
-    plugin.presentation = SimpleNamespace(
-        build=AsyncMock(return_value=[{"image": "card.png", "text": "full stats"}])
-    )
+    plugin.presentation = presentation([{"image": "card.png", "text": "full stats"}])
     target = event()
     await plugin._send_presentation(target, "match", [{}], "full stats")
     target.send.assert_awaited_once()
@@ -190,9 +265,7 @@ async def test_image_success_does_not_duplicate_text(plugin_class):
 @pytest.mark.asyncio
 async def test_manual_image_timeout_does_not_immediately_duplicate(plugin_class):
     plugin = plugin_class.__new__(plugin_class)
-    plugin.presentation = SimpleNamespace(
-        build=AsyncMock(return_value=[{"image": "card.png", "text": "full stats"}])
-    )
+    plugin.presentation = presentation([{"image": "card.png", "text": "full stats"}])
     target = event()
     target.send.side_effect = TimeoutError("uncertain delivery")
     await plugin._send_presentation(target, "match", [{}], "full stats")

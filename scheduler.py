@@ -236,6 +236,81 @@ class HLTVScheduler:
         now = datetime.now(tz=self.get_tz())
         return now.strftime("%Y-%m-%d")
 
+    async def fetch_schedule_matches(self, days: int = 5) -> List[Dict[str, Any]]:
+        """实时列表不附加日期窗口，避免跨日直播被上游赛程窗口排除。"""
+        matches, live = await asyncio.gather(
+            self.client.get_matches(status="all", days=days, limit=300),
+            self.client.get_live_matches(),
+            return_exceptions=True,
+        )
+        if isinstance(matches, BaseException):
+            raise matches
+        if isinstance(live, BaseException):
+            logger.warning("[HLTV] 补充实时赛程失败，使用赛程列表: %s", live)
+            return matches
+        # Live responses have fresher status and take precedence over list rows.
+        seen = set()
+        combined = []
+        for match in live + matches:
+            match_id = match.get("id")
+            if match_id is not None:
+                if str(match_id) in seen:
+                    continue
+                seen.add(str(match_id))
+            combined.append(match)
+        return combined
+
+    def select_schedule_matches(
+        self, matches: List[Dict[str, Any]], now: Optional[datetime] = None
+    ) -> List[Dict[str, Any]]:
+        """按各赛事当地日期选择赛程，跨日进行中的比赛始终保留。"""
+        now = now or datetime.now(tz=self.get_tz())
+        events: Dict[str, List[Dict[str, Any]]] = {}
+        seen = set()
+        for match in matches:
+            if not self.is_tracked_match(match):
+                continue
+            match_id = match.get("id")
+            if match_id is not None:
+                if str(match_id) in seen:
+                    continue
+                seen.add(str(match_id))
+            event = match.get("event") or {}
+            key = str(event.get("id") or event.get("name") or "unknown")
+            events.setdefault(key, []).append(match)
+        selected = []
+        for event_matches in events.values():
+            current = []
+            future: Dict[str, List[Dict[str, Any]]] = {}
+            live = []
+            for match in event_matches:
+                if match.get("status") == "live":
+                    live.append(match)
+                ts = self.parse_starts_at_ts(match)
+                if ts is None:
+                    continue
+                day = self.get_matchday(match, ts)
+                today = now.astimezone(self.get_match_timezone(match)).strftime(
+                    "%Y-%m-%d"
+                )
+                if day == today:
+                    current.append(match)
+                elif day > today and match.get("status") == "upcoming":
+                    future.setdefault(day, []).append(match)
+            # Advance each event independently; a live match never disappears
+            # when its starting day (or another event's day) has ended.
+            if any(m.get("status") in ("live", "upcoming") for m in current):
+                chosen = current
+            elif future:
+                chosen = future[min(future)]
+            else:
+                chosen = current
+            selected.extend(live + [m for m in chosen if m not in live])
+        return sorted(
+            selected,
+            key=lambda m: (m.get("status") != "live", self.parse_starts_at_ts(m) or 0),
+        )
+
     def get_next_matchday(self, days: int = 1) -> str:
         """获取后续比赛日字符串（以用户显示时区当前日期为基准）"""
         now = datetime.now(tz=self.get_tz())
@@ -824,15 +899,10 @@ class HLTVScheduler:
             is_next_day: 是否为当日全部完赛后自动展示的次日预告
         """
         tz = self.get_tz()
-        now = datetime.now(tz=tz)
-        today_local_date = now.strftime("%Y-%m-%d")
-
         if is_next_day:
-            header_title = (
-                f"📅 【HLTV 今日关注赛程已全部结束，明日预告 (比赛日 {matchday_str})】"
-            )
+            header_title = f"📅 【HLTV 后续关注赛事预告 (比赛日 {matchday_str})】"
         else:
-            header_title = f"📅 【HLTV 今日关注赛事预告 (比赛日 {matchday_str})】"
+            header_title = f"📅 【HLTV 关注赛事赛程 (比赛日 {matchday_str})】"
 
         lines = [
             header_title,
@@ -855,25 +925,20 @@ class HLTVScheduler:
                 ts = self.parse_starts_at_ts(m)
                 if ts:
                     dt_user = datetime.fromtimestamp(ts, tz=tz)
-                    user_date = dt_user.strftime("%Y-%m-%d")
-                    clock_str = dt_user.strftime("%H:%M")
-                    # 如果在北京时间属于次日凌晨（例如 23:00 后过午夜 00:00/01:30）
-                    if user_date > today_local_date and not is_next_day:
-                        cst_time = f"次日 {clock_str}"
-                    else:
-                        cst_time = clock_str
+                    cst_time = dt_user.strftime("%m-%d %H:%M")
 
                     # 动态获取比赛当地真实时区
                     m_tz = self.get_match_timezone(m)
                     if m_tz.key != tz.key:
                         dt_local = datetime.fromtimestamp(ts, tz=m_tz)
-                        local_str = dt_local.strftime("%H:%M %Z")
+                        local_str = dt_local.strftime("%m-%d %H:%M %Z")
                         time_str = f"{cst_time} (当地 {local_str})"
                     else:
                         time_str = cst_time
 
                 id_suffix = f"  🆔 {m_id}" if m_id else ""
-                lines.append(f"{idx}. ⏰ {time_str} | ({fmt})")
+                status_label = "🔴 进行中 | " if m.get("status") == "live" else ""
+                lines.append(f"{idx}. {status_label}⏰ {time_str} | ({fmt})")
                 lines.append(f"   🏆 {event_name}{stage_str}")
                 lines.append(f"   ⚔️ {team1} 🆚 {team2}{id_suffix}")
                 lines.append("")
@@ -882,7 +947,7 @@ class HLTVScheduler:
                 lines.pop()
 
         lines.append("------------------------------------")
-        lines.append(f"📌 本比赛日共 {len(matches)} 场关注对决")
+        lines.append(f"📌 共 {len(matches)} 场关注对决（按各赛事当地比赛日）")
         lines.append("💡 发送 /hltv match <ID或战队> 查看全员KDA与Rating")
         lines.append("💡 发送 /hltv live 可随时查看实时赛况")
         return "\n".join(lines)
@@ -1001,17 +1066,8 @@ class HLTVScheduler:
                 + max(1, int(self.config.get("result_retry_interval", 10))) * 60
             )
             # 查询未来比赛并按比赛日聚合
-            upcoming = await self.client.get_upcoming_matches(days=3, limit=300)
-            today_major_matches: List[Dict[str, Any]] = []
-
-            for m in upcoming:
-                if not self.is_tracked_match(m):
-                    continue
-                ts = self.parse_starts_at_ts(m)
-                if ts:
-                    m_day = self.get_matchday(m, ts)
-                    if m_day == current_matchday:
-                        today_major_matches.append(m)
+            upcoming = await self.fetch_schedule_matches(days=3)
+            today_major_matches = self.select_schedule_matches(upcoming, now)
 
             if not today_major_matches:
                 logger.info(
@@ -1019,14 +1075,13 @@ class HLTVScheduler:
                 )
                 return
 
-            today_major_matches.sort(key=lambda x: self.parse_starts_at_ts(x) or 0)
-            msg = self.format_daily_schedule(today_major_matches, current_matchday)
+            msg = self.format_daily_schedule(today_major_matches, "按赛事当地日期")
             self._enqueue(
                 f"daily:{current_matchday}",
                 "schedule",
                 today_major_matches,
                 msg,
-                title=f"比赛日 {current_matchday}",
+                title="关注赛事赛程",
             )
 
     async def check_match_reminders(self, now_ts: float) -> None:

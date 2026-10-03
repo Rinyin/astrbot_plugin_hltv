@@ -104,6 +104,21 @@ class AssetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.requests[-1]["If-None-Match"], '"v1"')
         self.assertGreater(self.cache.index["team:1"]["checked"], 0)
 
+    async def test_cold_nonblocking_lookup_downloads_once_and_later_reuses(self):
+        self.block = asyncio.Event()
+        results = await asyncio.wait_for(
+            asyncio.gather(
+                *(self.cache.get("team", 1, self.url, wait=False) for _ in range(12))
+            ),
+            1,
+        )
+        self.assertEqual(results, [None] * 12)
+        self.assertEqual(len(self.cache._tasks), 1)
+        self.block.set()
+        await asyncio.gather(*list(self.cache._tasks.values()))
+        self.assertTrue(await self.cache.get("team", 1, self.url, wait=False))
+        self.assertEqual(len(self.requests), 1)
+
     async def test_url_change_failure_keeps_old_asset_and_cools(self):
         original = await self.cache.get("team", 1, self.url)
         self.bad = True
@@ -272,6 +287,41 @@ class PresentationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(pages), 3)
         counts = [len(call.args[0]) for call in self.service.render_html.call_args_list]
         self.assertEqual(counts, [6, 1, 1])
+
+    async def test_cold_assets_and_event_do_not_delay_first_page(self):
+        gate = asyncio.Event()
+
+        async def download(*args, **kwargs):
+            await gate.wait()
+            return png(), {}
+
+        async def event(*args):
+            await gate.wait()
+            return {"header_image": "https://example.org/event.png"}
+
+        await self.service.assets.close()
+        self.service.assets = assets.AssetCache(
+            Path(self.temporary.name) / "cold", download_asset=download
+        )
+        self.service.client.get_event = AsyncMock(side_effect=event)
+        self.service._render = AsyncMock(return_value=None)
+        pages = self.service.iter_pages("schedule", [match() for _ in range(7)], "text")
+        try:
+            first = await asyncio.wait_for(anext(pages), 1)
+            self.assertIn("1/2", first["caption"])
+            self.service._render.assert_awaited_once()
+            self.assertTrue(self.service.assets._tasks)
+            self.assertTrue(self.service._event_tasks)
+            gate.set()
+            await asyncio.gather(*list(self.service.assets._tasks.values()))
+            await asyncio.gather(*list(self.service._event_tasks.values()))
+            await asyncio.wait_for(anext(pages), 1)
+            models = self.service.render_html.call_args.args[0]
+            self.assertTrue(models[0]["groups"][0]["players"][0]["image"])
+            self.service.client.get_event.assert_awaited_once()
+        finally:
+            gate.set()
+            await pages.aclose()
 
     async def test_disabled_image_does_not_render(self):
         self.service.config["image_enabled"] = False
