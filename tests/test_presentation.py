@@ -152,6 +152,40 @@ class AssetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.cache.get("team", 1, None), original)
         self.assertEqual(len(self.requests), 1)
 
+    async def test_prefetch_warms_once_and_get_reuses_it(self):
+        self.assertTrue(await self.cache.prefetch("team", 7, self.url))
+        self.assertEqual(len(self.requests), 1)
+        image = await self.cache.get("team", 7, self.url)
+        self.assertTrue(image.startswith("data:image/png"))
+        self.assertEqual(len(self.requests), 1)
+        self.assertTrue(await self.cache.prefetch("team", 7, self.url))
+
+    async def test_prefetch_skips_local_override_and_missing_url(self):
+        path = Path(self.temporary.name) / "local" / "player" / "5.png"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(png("green"))
+        self.assertTrue(await self.cache.prefetch("player", 5, self.url))
+        self.assertFalse(await self.cache.prefetch("team", 8, None))
+        self.assertEqual(self.requests, [])
+
+    async def test_prefetch_reports_cold_download_failure(self):
+        self.bad = True
+        self.assertFalse(await self.cache.prefetch("team", 3, self.url))
+        self.assertEqual(len(self.requests), 1)
+        # The failure is cooling down and must not be retried immediately.
+        self.assertFalse(await self.cache.prefetch("team", 3, self.url))
+        self.assertEqual(len(self.requests), 1)
+
+    async def test_prefetch_redownloads_when_cache_file_deleted(self):
+        self.assertTrue(await self.cache.prefetch("team", 1, self.url))
+        await asyncio.gather(*list(self.cache._tasks.values()))
+        self.assertEqual(len(self.requests), 1)
+        (self.cache.directory / self.cache.index["team:1"]["file"]).unlink()
+        self.assertTrue(await self.cache.prefetch("team", 1, self.url))
+        self.assertEqual(len(self.requests), 2)
+        self.assertNotIn("If-None-Match", self.requests[1])
+        self.assertTrue(await self.cache.get("team", 1, self.url))
+
     def test_svg_validation(self):
         self.assertEqual(
             assets.image_mime(
@@ -322,6 +356,105 @@ class PresentationTests(unittest.IsolatedAsyncioTestCase):
         finally:
             gate.set()
             await pages.aclose()
+
+    async def test_prefetch_dedupes_shared_assets_and_honors_limit(self):
+        self.service.assets.prefetch = AsyncMock(return_value=True)
+
+        def warm(match_id):
+            item = match()
+            item["id"] = match_id
+            item["team1"]["logo"] = "https://example.org/alpha.png"
+            item["team2"]["logo"] = "https://example.org/beta.png"
+            return item
+
+        await self.service.prefetch_assets([warm("1"), warm("2")], pause=0)
+        calls = [
+            (call.args[0], call.args[1])
+            for call in self.service.assets.prefetch.await_args_list
+        ]
+        self.assertEqual(len(calls), len(set(calls)))
+        self.assertEqual(self.service.assets.prefetch.await_count, 12)
+        self.assertIn(("team", "10"), calls)
+        self.assertIn(("player", "9"), calls)
+
+        self.service.assets.prefetch.reset_mock()
+        await self.service.prefetch_assets([warm("3")], limit=4, pause=0)
+        self.assertEqual(self.service.assets.prefetch.await_count, 4)
+
+    async def test_prefetch_raises_when_asset_fails(self):
+        self.service.assets.prefetch = AsyncMock(return_value=False)
+        with self.assertRaises(RuntimeError):
+            await self.service.prefetch_assets([match()], pause=0)
+
+    async def test_prefetch_raises_on_partial_roster_failure(self):
+        self.service.assets.prefetch = AsyncMock(return_value=True)
+        self.service.client.get_team = AsyncMock(
+            side_effect=lambda team_id: (
+                {"roster": [{"player_id": "1", "photo": "https://x/1.png"}]}
+                if team_id == "10"
+                else None
+            )
+        )
+        with self.assertRaises(RuntimeError):
+            await self.service.prefetch_assets([match()], pause=0, roster_pause=0)
+
+    async def test_prefetch_skips_when_images_disabled(self):
+        self.service.assets.prefetch = AsyncMock(return_value=True)
+        self.service.config["image_enabled"] = False
+        self.assertEqual(await self.service.prefetch_assets([match()]), 0)
+        self.service.assets.prefetch.assert_not_awaited()
+
+    async def test_prefetch_rosters_dedupe_and_skip_benched(self):
+        self.service.assets.prefetch = AsyncMock(return_value=True)
+        rosters = {
+            "10": {
+                "roster": [
+                    {
+                        "player_id": "101",
+                        "photo": "https://example.org/101.png",
+                        "status": "STARTER",
+                    },
+                    {
+                        "player_id": "102",
+                        "photo": "https://example.org/102.png",
+                        "status": "BENCHED",
+                    },
+                    {"player_id": "103", "photo": "https://example.org/103.png"},
+                ]
+            },
+            "20": {
+                "roster": [
+                    {
+                        "player_id": "201",
+                        "photo": "https://example.org/201.png",
+                        "status": "STARTER",
+                    }
+                ]
+            },
+        }
+        self.service.client.get_team = AsyncMock(
+            side_effect=lambda team_id: rosters.get(team_id)
+        )
+        await self.service.prefetch_assets(
+            [match(), match()], pause=0, roster_pause=0, matchday="2026-10-03"
+        )
+        self.assertEqual(
+            [call.args[0] for call in self.service.client.get_team.await_args_list],
+            ["10", "20"],
+        )
+        players = {
+            str(call.args[1])
+            for call in self.service.assets.prefetch.await_args_list
+            if call.args[0] == "player"
+        }
+        self.assertTrue({"101", "103", "201"} <= players)
+        self.assertNotIn("102", players)
+        # A retry for the same push day reuses the cached rosters.
+        self.service.client.get_team.reset_mock()
+        await self.service.prefetch_assets(
+            [match()], pause=0, roster_pause=0, matchday="2026-10-03"
+        )
+        self.service.client.get_team.assert_not_awaited()
 
     async def test_disabled_image_does_not_render(self):
         self.service.config["image_enabled"] = False

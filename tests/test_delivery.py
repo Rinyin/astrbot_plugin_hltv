@@ -111,6 +111,130 @@ class DailyRetryTests(unittest.IsolatedAsyncioTestCase):
         scheduler._enqueue.assert_called_once()
 
 
+class DailyPrefetchTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        scheduler_class = load_scheduler()
+        self.scheduler = scheduler_class.__new__(scheduler_class)
+        scheduler = self.scheduler
+        scheduler.config = {
+            "daily_schedule_time": "09:00",
+            "result_retry_interval": 10,
+            "daily_schedule_enabled": True,
+            "daily_asset_prefetch_enabled": True,
+            "image_enabled": True,
+            "tracked_events": ["1"],
+        }
+        scheduler.last_asset_prefetch_date = None
+        scheduler._asset_prefetch_retry_at = 0.0
+        scheduler._asset_prefetch_task = None
+        scheduler.last_daily_date = None
+        scheduler.presentation = types.SimpleNamespace(prefetch_assets=AsyncMock())
+        scheduler.get_current_matchday = Mock(return_value="2026-10-03")
+        scheduler.get_tracked_event_ids = Mock(return_value=["1"])
+        scheduler.get_tz = Mock(return_value=ZoneInfo("Asia/Shanghai"))
+        scheduler._save_state = Mock()
+        scheduler.fetch_schedule_matches = AsyncMock(return_value=[{"id": 1}])
+        scheduler.select_schedule_matches = Mock(return_value=[{"id": 1}])
+
+    @staticmethod
+    def at(hour, minute):
+        return datetime(2026, 10, 3, hour, minute, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    async def test_prefetch_waits_for_window_and_runs_once(self):
+        scheduler = self.scheduler
+        scheduler.maybe_start_asset_prefetch(self.at(7, 59))
+        self.assertIsNone(scheduler._asset_prefetch_task)
+        scheduler.maybe_start_asset_prefetch(self.at(8, 0))
+        task = scheduler._asset_prefetch_task
+        self.assertIsNotNone(task)
+        await task
+        await asyncio.sleep(0)
+        scheduler.presentation.prefetch_assets.assert_awaited_once()
+        self.assertEqual(scheduler.last_asset_prefetch_date, "2026-10-03")
+        self.assertEqual(
+            scheduler.select_schedule_matches.call_args.args[1],
+            self.at(9, 0),
+        )
+        scheduler.maybe_start_asset_prefetch(self.at(8, 30))
+        self.assertIsNone(scheduler._asset_prefetch_task)
+        self.assertEqual(scheduler.presentation.prefetch_assets.await_count, 1)
+
+    async def test_cross_day_window_prewarms_next_push_date(self):
+        scheduler = self.scheduler
+        scheduler.config["daily_schedule_time"] = "00:30"
+        scheduler.maybe_start_asset_prefetch(self.at(23, 30))
+        task = scheduler._asset_prefetch_task
+        self.assertIsNotNone(task)
+        await task
+        await asyncio.sleep(0)
+        # 23:30 on Oct 3 warms the Oct 4 00:30 push schedule, keyed by Oct 4.
+        self.assertEqual(scheduler.last_asset_prefetch_date, "2026-10-04")
+        self.assertEqual(
+            scheduler.select_schedule_matches.call_args.args[1],
+            datetime(2026, 10, 4, 0, 30, tzinfo=ZoneInfo("Asia/Shanghai")),
+        )
+
+    async def test_empty_schedule_retries_instead_of_marking_day_done(self):
+        scheduler = self.scheduler
+        scheduler.fetch_schedule_matches = AsyncMock(return_value=[])
+        scheduler.select_schedule_matches = Mock(return_value=[])
+        with self.assertLogs(level="WARNING"):
+            scheduler.maybe_start_asset_prefetch(self.at(8, 0))
+            task = scheduler._asset_prefetch_task
+            with self.assertRaises(RuntimeError):
+                await task
+            await asyncio.sleep(0)
+        self.assertIsNone(scheduler.last_asset_prefetch_date)
+        self.assertGreater(scheduler._asset_prefetch_retry_at, 0)
+
+    async def test_prefetch_skips_after_push_or_when_disabled(self):
+        scheduler = self.scheduler
+        scheduler.last_daily_date = "2026-10-03"
+        scheduler.maybe_start_asset_prefetch(self.at(8, 30))
+        self.assertIsNone(scheduler._asset_prefetch_task)
+        scheduler.last_daily_date = None
+        scheduler.config["daily_asset_prefetch_enabled"] = False
+        scheduler.maybe_start_asset_prefetch(self.at(8, 30))
+        self.assertIsNone(scheduler._asset_prefetch_task)
+        scheduler.config["daily_asset_prefetch_enabled"] = True
+        scheduler.config["image_enabled"] = False
+        scheduler.maybe_start_asset_prefetch(self.at(8, 30))
+        self.assertIsNone(scheduler._asset_prefetch_task)
+
+    async def test_prefetch_failure_retries_later(self):
+        scheduler = self.scheduler
+        scheduler.fetch_schedule_matches = AsyncMock(
+            side_effect=RuntimeError("offline")
+        )
+        with self.assertLogs(level="WARNING"):
+            scheduler.maybe_start_asset_prefetch(self.at(8, 0))
+            task = scheduler._asset_prefetch_task
+            with self.assertRaises(RuntimeError):
+                await task
+            await asyncio.sleep(0)
+        self.assertIsNone(scheduler.last_asset_prefetch_date)
+        self.assertGreater(scheduler._asset_prefetch_retry_at, 0)
+
+    async def test_stop_cancels_running_prefetch(self):
+        scheduler = self.scheduler
+        scheduler._task = None
+        scheduler._running = False
+        scheduler.delivery = types.SimpleNamespace(stop=AsyncMock())
+        started = asyncio.Event()
+
+        async def slow(push_date, target):
+            started.set()
+            await asyncio.Event().wait()
+
+        scheduler._prefetch_daily_assets = slow
+        task = asyncio.create_task(slow("2026-10-03", self.at(9, 0)))
+        scheduler._asset_prefetch_task = task
+        await started.wait()
+        await scheduler.stop()
+        self.assertTrue(task.cancelled())
+        self.assertIsNone(scheduler._asset_prefetch_task)
+
+
 class DeliveryTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()

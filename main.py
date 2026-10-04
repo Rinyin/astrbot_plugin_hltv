@@ -16,7 +16,7 @@ PLUGIN_NAME = "astrbot_plugin_hltv"
     PLUGIN_NAME,
     "Rinyi",
     "HLTV CS2 关注赛事赛前10分钟提醒、赛后战报获取与每日赛程推送",
-    "1.4.2",
+    "1.4.3",
     "https://github.com/Rinyi/astrbot_plugin_hltv",
 )
 class HLTVPlugin(Star):
@@ -588,6 +588,7 @@ class HLTVPlugin(Star):
             f"• 历史已提醒比赛数：{len(self.scheduler.reminded_match_ids)} 场\n"
             f"• 图片输出：{'开启' if self.config.get('image_enabled', True) else '关闭'}"
             f" / 后端：{self.config.get('render_backend', 'auto')}\n"
+            f"• 每日素材预下载：{'开启' if self.config.get('daily_asset_prefetch_enabled', True) else '关闭'}\n"
             f"• 素材更新检查：{self.config.get('asset_refresh_days', 90)} 天"
             f" / 容量：{self.config.get('asset_cache_max_mb', 1024)} MB\n"
             f"• 待投递任务：{delivery['pending']} / 失败任务：{delivery['failed']}"

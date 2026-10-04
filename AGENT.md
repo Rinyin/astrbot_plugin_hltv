@@ -24,6 +24,7 @@
   - `TBA` 地图占位不返回；未开赛比赛不返回选手数据；进行中比赛的大比分由已打完地图推算。
   - `format` 只返回 `boN`；弃权赛用 `forfeit: true` 表示。赛果列表带 `stars`（星数）。
   - `/api/v1/results?event=<ID>` 支持按赛事过滤，返回的比赛带 `event.id`。
+  - `/api/v1/teams/{id}` 返回 `team:{id, logo, roster:[{player_id, nickname, photo, status}]}`；`status` 为 `STARTER`/`BENCHED`，用于按首发预热选手头像。
 - **网络防污染与直连机制**：
   - Windows 环境下常存在 TUN/Clash 等代理软件接管流量（产生 Fake-IP，导致 TLS 握手异常或 DNS 污染）。
   - 插件内置 `HostResolver`；用户在配置 `server_ip` 后，将 API 域名固定解析到该 IP。默认留空，使用系统 DNS。请求超时 15s 并有容错处理。
@@ -54,6 +55,7 @@
 ### 3.3 每日固定时间赛程定时推送
 - 用户可配置每日推送时间点（默认 `09:00`，24 小时制 `HH:MM`）。
 - 到达指定时间点自动汇总当日已标记赛事的赛程并群发推送。
+- 推送前 1 小时，在后台预下载当日已标记赛事的战队与选手图片（跨场次/订阅去重、低并发限速、只读缓存命中即跳过、失败按重试间隔再试，不阻塞推送与前台查询，插件卸载时清理）。赛程列表缺少选手定妆照时，通过 `/api/v1/teams/{id}` 获取 roster，仅预热 STARTER（无 status 视为首发）、跳过 BENCHED 及其他非活跃状态；战队名单按推送日缓存，重试只补齐失败战队与素材。仅处理已标记赛事，以降低触发图片 CDN/Cloudflare 的概率。可通过 `daily_asset_prefetch_enabled` 关闭。
 
 ### 3.4 比赛数据与单图选手详细查询 (`/hltv match`)
 - 支持通过指令查询任意比赛（正在进行、已完赛、未开赛）的深度数据：
@@ -132,6 +134,7 @@
 8. `result_retry_interval` (int): 10；`max_result_retries` (int): 30
 9. `daily_schedule_time` (string): `09:00`
 10. `timezone` (string): `Asia/Shanghai`
+11. `daily_asset_prefetch_enabled` (bool): `true`；每日赛程推送前 1 小时预下载当日关注赛事图片
 
 代码中读取的键名必须与此一致；不得引用 schema 中不存在的键。
 

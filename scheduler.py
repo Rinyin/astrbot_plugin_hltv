@@ -135,6 +135,11 @@ class HLTVScheduler:
         self._daily_retry_date: Optional[str] = None
         self._daily_retry_at = 0.0
 
+        # 每日赛程推送前的素材预热：每个比赛日只调度一次，失败后按重试间隔再来
+        self.last_asset_prefetch_date: Optional[str] = None
+        self._asset_prefetch_task: Optional[asyncio.Task] = None
+        self._asset_prefetch_retry_at = 0.0
+
         # 已标记赛事的名称缓存 {event_id: name}，用于在消息中显示赛事名
         self.event_names: Dict[str, str] = {}
 
@@ -328,6 +333,7 @@ class HLTVScheduler:
                 self.reported_match_ids = set(data.get("reported_match_ids", []))
                 self.last_daily_date = data.get("last_daily_date")
                 self.event_names = dict(data.get("event_names", {}))
+                self.last_asset_prefetch_date = data.get("last_asset_prefetch_date")
                 logger.info(
                     f"[HLTV] 载入运行状态: 已提醒 {len(self.reminded_match_ids)} 场, "
                     f"正在追踪 {len(self.tracking_matches)} 场, 已播报战报 {len(self.reported_match_ids)} 场"
@@ -348,6 +354,7 @@ class HLTVScheduler:
                 "reported_match_ids": reported_list,
                 "last_daily_date": self.last_daily_date,
                 "event_names": self.event_names,
+                "last_asset_prefetch_date": self.last_asset_prefetch_date,
             }
             with open(self.state_file_path + ".tmp", "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
@@ -374,6 +381,13 @@ class HLTVScheduler:
             except asyncio.CancelledError:
                 pass
             self._task = None
+        if self._asset_prefetch_task and not self._asset_prefetch_task.done():
+            self._asset_prefetch_task.cancel()
+            try:
+                await self._asset_prefetch_task
+            except asyncio.CancelledError:
+                pass
+        self._asset_prefetch_task = None
         self._save_state()
         await self.delivery.stop()
         logger.info("[HLTV] 后台调度轮询任务已停止。")
@@ -1034,6 +1048,100 @@ class HLTVScheduler:
         lines.append("💡 发送 /hltv today 查看最新关注赛程")
         return "\n".join(lines)
 
+    def _daily_schedule_hm(self) -> Optional[int]:
+        """每日赛程推送时间转成当日分钟数；配置非法时返回 None。"""
+        raw = str(self.config.get("daily_schedule_time", "09:00")).strip()
+        try:
+            hour, _, minute = raw.partition(":")
+            hour, minute = int(hour), int(minute or 0)
+        except (TypeError, ValueError):
+            return None
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            return None
+        return hour * 60 + minute
+
+    def maybe_start_asset_prefetch(self, now: datetime) -> None:
+        """在每日赛程推送前 1 小时，后台预热该次推送赛程的战队/选手素材。
+
+        以「下一次推送时间」为准（可能跨天，如 00:30 推送在前一天 23:30 预热），
+        用该推送时刻选择赛程，并把推送日期作为已完成标记。仅调度一次，任务在后台
+        运行，不阻塞调度循环、推送或前台查询。
+        """
+        if not self.config.get("daily_schedule_enabled", True):
+            return
+        if not self.config.get("daily_asset_prefetch_enabled", True):
+            return
+        if not self.config.get("image_enabled", True):
+            return
+        if self.presentation is None or not self.get_tracked_event_ids():
+            return
+
+        target_minutes = self._daily_schedule_hm()
+        if target_minutes is None:
+            logger.warning(
+                "[HLTV] 每日赛程时间 %r 非法，跳过素材预下载。",
+                self.config.get("daily_schedule_time"),
+            )
+            return
+        target = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(
+            minutes=target_minutes
+        )
+        if target <= now:
+            target += timedelta(days=1)
+        if now < target - timedelta(hours=1):
+            return
+
+        push_date = target.strftime("%Y-%m-%d")
+        if self.last_asset_prefetch_date == push_date:
+            return
+        if now.timestamp() < self._asset_prefetch_retry_at:
+            return
+        # 该次赛程已推送则无需预热，避免既无素材收益又浪费请求
+        if self.last_daily_date == push_date:
+            return
+
+        task = self._asset_prefetch_task
+        if task is not None and not task.done():
+            return
+
+        logger.info("[HLTV] 触发 %s 赛程素材预下载（推送前 1 小时）。", push_date)
+        self._asset_prefetch_task = asyncio.create_task(
+            self._prefetch_daily_assets(push_date, target)
+        )
+        self._asset_prefetch_task.add_done_callback(self._on_asset_prefetch_done)
+
+    def _on_asset_prefetch_done(self, task: asyncio.Task) -> None:
+        if self._asset_prefetch_task is task:
+            self._asset_prefetch_task = None
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except Exception:
+            logger.warning("[HLTV] 每日素材预下载失败，稍后重试", exc_info=True)
+            retry_min = max(10, int(self.config.get("result_retry_interval", 10)))
+            self._asset_prefetch_retry_at = (
+                datetime.now(tz=self.get_tz()).timestamp() + retry_min * 60
+            )
+
+    async def _prefetch_daily_assets(self, push_date: str, target: datetime) -> None:
+        """后台任务：按推送时刻选择赛程并预热素材（空结果视为失败以便重试）。"""
+        matches = await self.fetch_schedule_matches(days=3)
+        selected = self.select_schedule_matches(matches, target)
+        if not selected:
+            # 网络异常与当天确实无比赛都会返回空，保守重试而不是直接标记完成。
+            raise RuntimeError("赛程为空")
+        if self.presentation is not None:
+            await self.presentation.prefetch_assets(selected, matchday=push_date)
+        self.last_asset_prefetch_date = push_date
+        self._asset_prefetch_retry_at = 0.0
+        self._save_state()
+        logger.info(
+            "[HLTV] %s 赛程素材预下载已完成（%d 场关注比赛）。",
+            push_date,
+            len(selected),
+        )
+
     async def check_daily_schedule(self, now: datetime) -> None:
         """检查并触发每日赛程推送"""
         if not self.config.get("daily_schedule_enabled", True):
@@ -1234,6 +1342,9 @@ class HLTVScheduler:
 
                 # 1. 每日固定时间赛程推送检查
                 await self.check_daily_schedule(now)
+
+                # 1b. 每日赛程推送前 1 小时预热当日关注赛事素材（后台任务）
+                self.maybe_start_asset_prefetch(now)
 
                 # 2. 赛前提醒检查（每 60 秒拉取一次接口进行比对）
                 if now_ts - last_match_poll_ts >= 60.0:

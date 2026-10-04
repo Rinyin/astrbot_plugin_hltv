@@ -209,6 +209,13 @@ class HLTVClient:
             return data.get("event")
         return None
 
+    async def get_team(self, team_id: str) -> Optional[Dict[str, Any]]:
+        """获取战队详情（含 id/logo 与 roster 选手名单及头像）"""
+        data = await self._get(f"/api/v1/teams/{team_id}")
+        if data and isinstance(data, dict):
+            return data.get("team")
+        return None
+
     async def find_match(self, query: str) -> Optional[Dict[str, Any]]:
         """根据比赛ID或战队名称查找比赛详情"""
         clean_q = query.strip()

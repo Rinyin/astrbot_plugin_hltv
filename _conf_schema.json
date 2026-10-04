@@ -69,6 +69,11 @@
         "type": "string",
         "default": "09:00"
     },
+    "daily_asset_prefetch_enabled": {
+        "description": "每日赛程推送前1小时后台预下载当日关注赛事的战队与选手图片，避免推送时缺图并减少触发图片CDN限流",
+        "type": "bool",
+        "default": true
+    },
     "timezone": {
         "description": "本地显示时区名称 (默认 Asia/Shanghai，即北京时间)",
         "type": "string",

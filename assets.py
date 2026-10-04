@@ -78,27 +78,51 @@ class AssetCache:
         self._download_asset = download_asset
         self._closing = False
 
-    def _local_override(self, kind, entity_id):
-        """Stable user-owned files take precedence and are never cache-pruned."""
+    def _local_candidates(self, kind, entity_id):
+        """Yield user-owned candidate files for an entity, most common first."""
         if kind not in {"team", "player", "event"} or not re.fullmatch(
             r"[A-Za-z0-9_-]+", str(entity_id or "")
         ):
-            return None
+            return
         for extension in ("png", "jpg", "jpeg", "webp", "svg"):
-            path = self.directory / "local" / kind / f"{entity_id}.{extension}"
+            yield self.directory / "local" / kind / f"{entity_id}.{extension}"
+
+    def _read_local(self, path):
+        """Read and validate one user-owned file, returning its data URI."""
+        # Bound the read itself, including files changed during the read.
+        with path.open("rb") as source:
+            content = source.read(5 * 1024 * 1024 + 1)
+        if len(content) > 5 * 1024 * 1024:
+            raise ValueError("Local asset exceeds 5MB")
+        mime = image_mime(content)
+        return f"data:{mime};base64,{base64.b64encode(content).decode()}"
+
+    def _local_override(self, kind, entity_id):
+        """Stable user-owned files take precedence and are never cache-pruned."""
+        for path in self._local_candidates(kind, entity_id):
             if not path.is_file():
                 continue
             try:
-                # Bound the read itself, including files changed during the read.
-                with path.open("rb") as source:
-                    content = source.read(5 * 1024 * 1024 + 1)
-                if len(content) > 5 * 1024 * 1024:
-                    raise ValueError("Local asset exceeds 5MB")
-                mime = image_mime(content)
-                return f"data:{mime};base64,{base64.b64encode(content).decode()}"
+                return self._read_local(path)
             except (OSError, ValueError, ET.ParseError):
                 logger.warning("[HLTV] 本地素材无效: %s", path.name, exc_info=True)
         return None
+
+    def _has_valid_local(self, kind, entity_id):
+        """True only when a valid user-owned file can satisfy the entity.
+
+        Prefetch must not skip the network when the first local candidate is
+        corrupt, otherwise the next render falls back to a placeholder.
+        """
+        for path in self._local_candidates(kind, entity_id):
+            if not path.is_file():
+                continue
+            try:
+                self._read_local(path)
+                return True
+            except (OSError, ValueError, ET.ParseError):
+                continue
+        return False
 
     def _save(self):
         temporary = self.index_path.with_suffix(".tmp")
@@ -179,6 +203,78 @@ class AssetCache:
         # Shield the download so a page's five-second asset budget does not cancel it.
         await asyncio.shield(task)
         return await self._cached(key)
+
+    async def prefetch(self, kind, entity_id, url):
+        """Ensure one asset is usable, returning whether it will render.
+
+        ``True`` means a valid local file or cached file is available after this
+        call; ``False`` means a cold download is still missing/failed. Reuses the
+        same per-key task registry as :meth:`get`, so a background prefetch and a
+        foreground render never download the same asset twice.
+        """
+        if self._closing:
+            return False
+        if await asyncio.to_thread(self._has_valid_local, kind, entity_id):
+            return True
+        if self._closing:
+            return False
+        if not url or urlparse(str(url)).scheme not in {"http", "https"}:
+            # No source to fetch; report a cached copy if one already exists.
+            return await asyncio.to_thread(self._cached_file_exists, kind, entity_id)
+        url = str(url)
+        key = f"{kind}:{entity_id or hashlib.sha256(url.encode()).hexdigest()}"
+        now = time.time()
+        entry = self.index.setdefault(key, {})
+        entry["accessed"] = now
+        file_name = entry.get("file")
+        if file_name and not (self.directory / Path(file_name).name).is_file():
+            # The index can outlive pruned/deleted files; force a full refetch
+            # instead of a conditional request the origin may answer with 304.
+            entry.pop("file", None)
+            entry.pop("etag", None)
+            entry.pop("modified", None)
+            file_name = None
+        if (
+            file_name
+            and entry.get("url") == url
+            and now - entry.get("checked", 0) < self.refresh_seconds
+        ):
+            return True
+        if entry.get("failed_url") == url and entry.get("retry_at", 0) > now:
+            # A recent failure is cooling down; the scheduler retries the job.
+            return False
+        task = self._tasks.get(key)
+        if task is None:
+            task = asyncio.create_task(self._refresh(key, url))
+            self._tasks[key] = task
+            task.add_done_callback(lambda done, k=key: self._tasks.pop(k, None))
+        # A cancelled prefetch must not cancel a download a page is waiting on,
+        # and _refresh already records failures for later cooling.
+        await asyncio.shield(task)
+        return await asyncio.to_thread(self._cached_file_exists, kind, entity_id, url)
+
+    def _cached_file_exists(self, kind, entity_id, url=None):
+        """Whether a validated local file or a live cache file is usable."""
+        if self._has_valid_local(kind, entity_id):
+            return True
+        if url:
+            key = f"{kind}:{entity_id or hashlib.sha256(str(url).encode()).hexdigest()}"
+            entry = self.index.get(key, {})
+            if entry.get("url") != str(url):
+                return False
+        else:
+            entry = self.index.get(f"{kind}:{entity_id or ''}", {})
+        file_name = entry.get("file")
+        if not file_name:
+            return False
+        path = self.directory / Path(file_name).name
+        if not path.is_file():
+            return False
+        try:
+            image_mime(path.read_bytes())
+            return True
+        except (OSError, ValueError, ET.ParseError):
+            return False
 
     async def _download(self, url, headers):
         if self._closing:
