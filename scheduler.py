@@ -109,6 +109,14 @@ CITY_KEYWORD_TIMEZONES: List[Tuple[List[str], str]] = [
     ),
 ]
 
+# 赛前单场素材预下载：开赛前 70 分钟起检查，须早于开赛前 10 分钟的提醒。
+MATCH_ASSET_PREFETCH_LEAD_SECONDS = 70 * 60
+MATCH_ASSET_PREFETCH_REMINDER_SECONDS = 10 * 60
+# 素材下载失败后 AssetCache 冷却 30 分钟，重试间隔不得低于它，否则只会空转。
+MATCH_ASSET_PREFETCH_COOLDOWN_SECONDS = 30 * 60
+# 已完成/待重试的赛前预热状态按开赛时间保留一天，未来改期比赛不会被误删。
+MATCH_ASSET_PREFETCH_RETENTION_SECONDS = 24 * 60 * 60
+
 
 class HLTVScheduler:
     """HLTV 比赛提醒、战报追踪与每日赛程调度器"""
@@ -139,6 +147,12 @@ class HLTVScheduler:
         self.last_asset_prefetch_date: Optional[str] = None
         self._asset_prefetch_task: Optional[asyncio.Task] = None
         self._asset_prefetch_retry_at = 0.0
+
+        # 赛前单场素材预热：按开赛时间持久化完成状态；改期即视为新任务，独立于每日赛程开关
+        self.prefetched_match_starts: Dict[str, float] = {}
+        self._match_prefetch_tasks: Dict[str, asyncio.Task] = {}
+        self._match_prefetch_retry_at: Dict[str, float] = {}
+        self._match_prefetch_starts: Dict[str, float] = {}
 
         # 已标记赛事的名称缓存 {event_id: name}，用于在消息中显示赛事名
         self.event_names: Dict[str, str] = {}
@@ -334,6 +348,13 @@ class HLTVScheduler:
                 self.last_daily_date = data.get("last_daily_date")
                 self.event_names = dict(data.get("event_names", {}))
                 self.last_asset_prefetch_date = data.get("last_asset_prefetch_date")
+                raw_completed = data.get("prefetched_match_starts") or {}
+                if isinstance(raw_completed, dict):
+                    self.prefetched_match_starts = {
+                        str(key): float(value)
+                        for key, value in raw_completed.items()
+                        if value is not None
+                    }
                 logger.info(
                     f"[HLTV] 载入运行状态: 已提醒 {len(self.reminded_match_ids)} 场, "
                     f"正在追踪 {len(self.tracking_matches)} 场, 已播报战报 {len(self.reported_match_ids)} 场"
@@ -355,6 +376,7 @@ class HLTVScheduler:
                 "last_daily_date": self.last_daily_date,
                 "event_names": self.event_names,
                 "last_asset_prefetch_date": self.last_asset_prefetch_date,
+                "prefetched_match_starts": self.prefetched_match_starts,
             }
             with open(self.state_file_path + ".tmp", "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
@@ -388,6 +410,12 @@ class HLTVScheduler:
             except asyncio.CancelledError:
                 pass
         self._asset_prefetch_task = None
+        match_tasks = list(self._match_prefetch_tasks.values())
+        for task in match_tasks:
+            task.cancel()
+        if match_tasks:
+            await asyncio.gather(*match_tasks, return_exceptions=True)
+        self._match_prefetch_tasks.clear()
         self._save_state()
         await self.delivery.stop()
         logger.info("[HLTV] 后台调度轮询任务已停止。")
@@ -1142,6 +1170,164 @@ class HLTVScheduler:
             len(selected),
         )
 
+    def _match_asset_prefetch_enabled(self) -> bool:
+        """赛前单场预热独立于每日赛程开关，仅随赛前提醒与图片输出启用。"""
+        return bool(
+            self.config.get("match_reminder_enabled", True)
+            and self.config.get("image_enabled", True)
+            and self.get_tracked_event_ids()
+            and self.presentation is not None
+        )
+
+    def _prune_match_prefetch_state(self, now_ts: float) -> None:
+        """按开赛时间清理过期的赛前预热状态，避免内存与状态文件无限增长。
+
+        只删除开赛已超过保留期的一天前的记录；未来（含改期延后）的比赛始终保留。
+        """
+        cutoff = now_ts - MATCH_ASSET_PREFETCH_RETENTION_SECONDS
+        self.prefetched_match_starts = {
+            match_id: starts
+            for match_id, starts in self.prefetched_match_starts.items()
+            if starts >= cutoff
+        }
+        self._match_prefetch_starts = {
+            match_id: starts
+            for match_id, starts in self._match_prefetch_starts.items()
+            if starts >= cutoff
+        }
+        for match_id in list(self._match_prefetch_retry_at):
+            if self._match_prefetch_starts.get(match_id, 0.0) < cutoff:
+                self._match_prefetch_retry_at.pop(match_id, None)
+
+    def _cancel_match_prefetch(self, match_id: str) -> None:
+        """丢弃某场比赛在途的旧预热任务（改期或清理时调用），不阻塞调度。"""
+        task = self._match_prefetch_tasks.pop(match_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    def maybe_start_match_asset_prefetch(
+        self,
+        match: Dict[str, Any],
+        match_id: str,
+        starts_ts: float,
+        now_ts: float,
+    ) -> None:
+        """开赛前 70 分钟至前 10 分钟之间，后台预热该场比赛所需图片。
+
+        与每日预热共用素材收集、名单获取、缓存与限速；每场同时只跑一个后台任务。
+        完成状态按开赛时间持久化：只有同一开赛时间才视为已完成，改期会重新校验并
+        丢弃旧任务。失败不设人为次数上限，而是按素材冷却时间（≥30 分钟）重试，
+        并由 70→10 分钟的时间窗天然收敛，避免在提醒前堆积无谓请求。
+        """
+        if not self._match_asset_prefetch_enabled():
+            return
+        previous_start = self._match_prefetch_starts.get(match_id)
+        if previous_start is not None and previous_start != starts_ts:
+            # Even a postponement outside the window invalidates queued work.
+            self._match_prefetch_retry_at.pop(match_id, None)
+            self._cancel_match_prefetch(match_id)
+        self._match_prefetch_starts[match_id] = starts_ts
+
+        time_diff = starts_ts - now_ts
+        if not (
+            MATCH_ASSET_PREFETCH_REMINDER_SECONDS
+            < time_diff
+            <= MATCH_ASSET_PREFETCH_LEAD_SECONDS
+        ):
+            return
+
+        # 仅当完成记录对应本次开赛时间时才跳过；改期后必须重新校验缓存。
+        if self.prefetched_match_starts.get(match_id) == starts_ts:
+            return
+        task = self._match_prefetch_tasks.get(match_id)
+        if task is not None and not task.done():
+            return
+        if now_ts < self._match_prefetch_retry_at.get(match_id, 0.0):
+            return
+
+        logger.info(
+            "[HLTV] 触发赛前素材预下载: 比赛 %s（约 %.0f 分钟后开赛）。",
+            match_id,
+            time_diff / 60,
+        )
+        task = asyncio.create_task(
+            self._prefetch_match_assets(match, match_id, starts_ts)
+        )
+        self._match_prefetch_tasks[match_id] = task
+        task.add_done_callback(
+            lambda done, mid=match_id, start=starts_ts: (
+                self._on_match_asset_prefetch_done(mid, start, done)
+            )
+        )
+
+    async def _prefetch_match_assets(
+        self, match: Dict[str, Any], match_id: str, starts_ts: float
+    ) -> bool:
+        """后台任务：预热单场比赛素材（失败抛出以便按冷却时间重试）。
+
+        等待共享预热锁期间比赛可能已被取消关注、提醒已发出或已进入提醒窗口，
+        因此交给 prefetch_assets 在拿到锁之后再次校验，避免排队很久后才发请求。
+        """
+
+        def still_needed() -> bool:
+            if not self._match_asset_prefetch_enabled():
+                return False
+            if not self.is_tracked_match(match):
+                return False
+            if self._match_prefetch_starts.get(match_id) != starts_ts:
+                return False
+            if (
+                match_id in self.reminded_match_ids
+                or f"reminder:{match_id}" in self.delivery.jobs
+            ):
+                return False
+            now_ts = datetime.now(tz=self.get_tz()).timestamp()
+            return now_ts < starts_ts - MATCH_ASSET_PREFETCH_REMINDER_SECONDS
+
+        if self.presentation is None:
+            return False
+        result = await self.presentation.prefetch_assets(
+            [match],
+            matchday=datetime.now(tz=self.get_tz()).strftime("%Y-%m-%d"),
+            should_run=still_needed,
+        )
+        # None means the recheck blocked the pass; do not treat it as warmed.
+        return result is not None
+
+    def _on_match_asset_prefetch_done(
+        self, match_id: str, starts_ts: float, task: asyncio.Task
+    ) -> None:
+        if self._match_prefetch_tasks.get(match_id) is task:
+            self._match_prefetch_tasks.pop(match_id, None)
+        if task.cancelled():
+            return
+        try:
+            warmed = task.result()
+        except Exception:
+            if self._match_prefetch_starts.get(match_id) != starts_ts:
+                return
+            logger.warning(
+                "[HLTV] 比赛 %s 赛前素材预下载失败，稍后重试", match_id, exc_info=True
+            )
+            retry_seconds = max(
+                MATCH_ASSET_PREFETCH_COOLDOWN_SECONDS,
+                int(self.config.get("result_retry_interval", 10)) * 60,
+            )
+            self._match_prefetch_retry_at[match_id] = (
+                datetime.now(tz=self.get_tz()).timestamp() + retry_seconds
+            )
+            return
+        if warmed is False:
+            # The guard skipped the pass; leave completion unset so a later
+            # re-track (before the reminder) can still warm the match.
+            return
+        # 旧一代任务完成时比赛可能已改期，只有仍是当前开赛时间才算完成。
+        if self._match_prefetch_starts.get(match_id) != starts_ts:
+            return
+        self.prefetched_match_starts[match_id] = starts_ts
+        self._match_prefetch_retry_at.pop(match_id, None)
+        self._save_state()
+
     async def check_daily_schedule(self, now: datetime) -> None:
         """检查并触发每日赛程推送"""
         if not self.config.get("daily_schedule_enabled", True):
@@ -1194,6 +1380,7 @@ class HLTVScheduler:
 
     async def check_match_reminders(self, now_ts: float) -> None:
         """检查未来 10 分钟内即将开赛的已标记赛事比赛并发送提醒"""
+        self._prune_match_prefetch_state(now_ts)
         if not self.get_tracked_event_ids():
             return
         upcoming = await self.client.get_upcoming_matches(days=1, limit=300)
@@ -1212,6 +1399,9 @@ class HLTVScheduler:
                 continue
 
             time_diff = starts_ts - now_ts
+
+            # 赛前 70 分钟起后台补齐该场图片（独立于每日赛程开关）
+            self.maybe_start_match_asset_prefetch(match, match_id, starts_ts, now_ts)
 
             # 赛前 10 分钟提醒区间：0 秒至 600 秒（10分钟）
             if 0 <= time_diff <= 600:

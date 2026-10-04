@@ -68,12 +68,17 @@ class PresentationService:
         self._playwright = None
         self._browser_lock = asyncio.Lock()
         self._render_limit = asyncio.Semaphore(2)
+        # Daily and per-match prewarm passes share the roster cache below; run
+        # them one at a time so they cannot clobber its date keys or duplicate
+        # roster/team requests. Both are background work, never foreground.
+        self._prefetch_lock = asyncio.Lock()
         self._cooldown = 0
         self._failures = 0
         self._event_cache = {}
         self._event_tasks = {}
-        self._roster_cache = {}
-        self._roster_day = None
+        # Keep separate date scopes for the current local date and a daily push
+        # being warmed before midnight, without resetting either roster cache.
+        self._roster_caches = OrderedDict()
         self._fonts = OrderedDict()
         self._build_tasks = set()
         self._closing = False
@@ -274,8 +279,8 @@ class PresentationService:
                     return ids
         return ids
 
-    async def _load_rosters(self, team_ids, pause):
-        """Resolve team rosters with a per-push-day memory cache.
+    async def _load_rosters(self, team_ids, pause, cache):
+        """Resolve team rosters with a per-date-scope memory cache.
 
         Successful rosters are reused across retries; teams without a usable
         roster are returned as missing so the caller retries only those.
@@ -289,7 +294,7 @@ class PresentationService:
             if self._closing:
                 missing.append(team_id)
                 continue
-            cached = self._roster_cache.get(team_id)
+            cached = cache.get(team_id)
             if cached:
                 rosters[team_id] = cached
                 continue
@@ -302,7 +307,7 @@ class PresentationService:
             except Exception:
                 logger.debug("[HLTV] 战队名单获取失败: %s", team_id, exc_info=True)
             if roster:
-                self._roster_cache[team_id] = roster
+                cache[team_id] = roster
                 rosters[team_id] = roster
             else:
                 missing.append(team_id)
@@ -333,6 +338,7 @@ class PresentationService:
         roster_pause=1.0,
         limit=300,
         team_limit=60,
+        should_run=None,
     ):
         """Warm the cache for a day's tracked matches ahead of the scheduled push.
 
@@ -340,62 +346,82 @@ class PresentationService:
         single deduplicated asset set (summary teams/players plus fielded roster
         portraits). Missing teams or failed downloads raise so the scheduler
         retries only the unfinished work. Cached assets are cheap checks.
+
+        ``should_run`` is re-evaluated after the shared prewarm lock is acquired
+        so queued work for a now-untracked, already-pushed or already-started
+        match never begins a network pass long after it was scheduled. It returns
+        ``None`` when that guard blocks the pass, so callers never mistake a
+        skipped pass for a completed warm.
         """
-        if self._closing or not matches or not self.config.get("image_enabled", True):
+        if self._closing or not matches:
             return 0
-        if self._roster_day != matchday:
-            self._roster_day = matchday
-            self._roster_cache = {}
-        team_ids = self._team_ids(matches, team_limit)
-        rosters, missing_teams = await self._load_rosters(team_ids, roster_pause)
+        # Serialise background prewarm passes: they share the roster caches and
+        # must not duplicate roster/team requests or interleave cache scopes.
+        async with self._prefetch_lock:
+            if self._closing:
+                return 0
+            if should_run is not None and not should_run():
+                return None
+            if not self.config.get("image_enabled", True):
+                return 0
+            cache = self._roster_caches.get(matchday)
+            if cache is None:
+                cache = {}
+                self._roster_caches[matchday] = cache
+                while len(self._roster_caches) > 8:
+                    self._roster_caches.popitem(last=False)
+            team_ids = self._team_ids(matches, team_limit)
+            rosters, missing_teams = await self._load_rosters(
+                team_ids, roster_pause, cache
+            )
 
-        requests = self._summary_requests(matches)
-        self._roster_requests(requests, rosters)
-        items = list(requests.values())
-        if limit and limit > 0:
-            items = items[:limit]
+            requests = self._summary_requests(matches)
+            self._roster_requests(requests, rosters)
+            items = list(requests.values())
+            if limit and limit > 0:
+                items = items[:limit]
 
-        gate = asyncio.Semaphore(max(1, int(concurrency)))
-        failed = []
+            gate = asyncio.Semaphore(max(1, int(concurrency)))
+            failed = []
 
-        async def warm(kind, entity_id, url):
-            async with gate:
-                if self._closing:
-                    return
-                try:
-                    usable = await self.assets.prefetch(kind, entity_id, url)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    logger.debug("[HLTV] 素材预下载失败", exc_info=True)
-                    usable = False
-                if not usable:
-                    failed.append(f"{kind}:{entity_id}")
-                if pause > 0:
-                    await asyncio.sleep(pause)
+            async def warm(kind, entity_id, url):
+                async with gate:
+                    if self._closing:
+                        return
+                    try:
+                        usable = await self.assets.prefetch(kind, entity_id, url)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.debug("[HLTV] 素材预下载失败", exc_info=True)
+                        usable = False
+                    if not usable:
+                        failed.append(f"{kind}:{entity_id}")
+                    if pause > 0:
+                        await asyncio.sleep(pause)
 
-        if items:
+            if items:
+                logger.info(
+                    "[HLTV] 开始预下载 %s 的 %d 项素材（战队 %d）",
+                    matchday or "",
+                    len(items),
+                    len(team_ids),
+                )
+                await asyncio.gather(*(warm(*item) for item in items))
+
+            if self._closing:
+                return 0
+            if missing_teams or failed:
+                raise RuntimeError(
+                    f"素材预下载未完成: 缺失战队 {len(missing_teams)}，失败素材 {len(failed)}"
+                )
             logger.info(
-                "[HLTV] 开始预下载 %s 的 %d 项素材（战队 %d）",
+                "[HLTV] %s 素材预下载完成: %d 项（战队 %d）",
                 matchday or "",
                 len(items),
                 len(team_ids),
             )
-            await asyncio.gather(*(warm(*item) for item in items))
-
-        if self._closing:
-            return 0
-        if missing_teams or failed:
-            raise RuntimeError(
-                f"素材预下载未完成: 缺失战队 {len(missing_teams)}，失败素材 {len(failed)}"
-            )
-        logger.info(
-            "[HLTV] %s 素材预下载完成: %d 项（战队 %d）",
-            matchday or "",
-            len(items),
-            len(team_ids),
-        )
-        return len(items)
+            return len(items)
 
     async def _event_background(self, match):
         event = match.get("event") or {}

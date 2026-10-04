@@ -3,6 +3,7 @@ import importlib.util
 import logging
 import sys
 import tempfile
+import time
 import types
 import unittest
 from datetime import datetime
@@ -127,6 +128,10 @@ class DailyPrefetchTests(unittest.IsolatedAsyncioTestCase):
         scheduler.last_asset_prefetch_date = None
         scheduler._asset_prefetch_retry_at = 0.0
         scheduler._asset_prefetch_task = None
+        scheduler.prefetched_match_starts = {}
+        scheduler._match_prefetch_tasks = {}
+        scheduler._match_prefetch_retry_at = {}
+        scheduler._match_prefetch_starts = {}
         scheduler.last_daily_date = None
         scheduler.presentation = types.SimpleNamespace(prefetch_assets=AsyncMock())
         scheduler.get_current_matchday = Mock(return_value="2026-10-03")
@@ -233,6 +238,261 @@ class DailyPrefetchTests(unittest.IsolatedAsyncioTestCase):
         await scheduler.stop()
         self.assertTrue(task.cancelled())
         self.assertIsNone(scheduler._asset_prefetch_task)
+
+
+class MatchPrefetchTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        scheduler_class = load_scheduler()
+        self.scheduler = scheduler_class.__new__(scheduler_class)
+        scheduler = self.scheduler
+        scheduler.config = {
+            "result_retry_interval": 10,
+            "match_reminder_enabled": True,
+            "image_enabled": True,
+            "daily_schedule_enabled": False,
+            "tracked_events": ["1"],
+        }
+        scheduler.presentation = types.SimpleNamespace(prefetch_assets=AsyncMock())
+        scheduler.prefetched_match_starts = {}
+        scheduler._match_prefetch_tasks = {}
+        scheduler._match_prefetch_retry_at = {}
+        scheduler._match_prefetch_starts = {}
+        scheduler.get_tz = Mock(return_value=ZoneInfo("Asia/Shanghai"))
+        scheduler.get_tracked_event_ids = Mock(return_value=["1"])
+        scheduler.get_matchday = Mock(return_value="2026-10-03")
+        scheduler._save_state = Mock()
+
+    @staticmethod
+    def match(match_id="42"):
+        return {
+            "id": match_id,
+            "event": {"id": "1", "name": "赛事"},
+            "team1": {"id": "10", "name": "Alpha"},
+            "team2": {"id": "20", "name": "Beta"},
+        }
+
+    async def test_window_runs_once_and_completion_dedupes(self):
+        scheduler = self.scheduler
+        now = 1000.0
+        starts = now + 70 * 60
+        scheduler.maybe_start_match_asset_prefetch(self.match(), "42", starts, now)
+        task = scheduler._match_prefetch_tasks.get("42")
+        self.assertIsNotNone(task)
+        await task
+        await asyncio.sleep(0)
+        scheduler.presentation.prefetch_assets.assert_awaited_once()
+        self.assertEqual(scheduler.prefetched_match_starts, {"42": starts})
+        scheduler.maybe_start_match_asset_prefetch(self.match(), "42", starts, now)
+        self.assertNotIn("42", scheduler._match_prefetch_tasks)
+        self.assertEqual(scheduler.presentation.prefetch_assets.await_count, 1)
+
+    async def test_outside_window_is_ignored(self):
+        scheduler = self.scheduler
+        now = 1000.0
+        scheduler.maybe_start_match_asset_prefetch(
+            self.match("1"), "1", now + 70 * 60 + 1, now
+        )
+        self.assertNotIn("1", scheduler._match_prefetch_tasks)
+        scheduler.maybe_start_match_asset_prefetch(
+            self.match("2"), "2", now + 5 * 60, now
+        )
+        self.assertNotIn("2", scheduler._match_prefetch_tasks)
+
+    async def test_gated_by_reminder_and_image_but_not_daily(self):
+        scheduler = self.scheduler
+        now = 1000.0
+        starts = now + 30 * 60
+        scheduler.config["match_reminder_enabled"] = False
+        scheduler.maybe_start_match_asset_prefetch(self.match("1"), "1", starts, now)
+        self.assertNotIn("1", scheduler._match_prefetch_tasks)
+        scheduler.config["match_reminder_enabled"] = True
+        scheduler.config["image_enabled"] = False
+        scheduler.maybe_start_match_asset_prefetch(self.match("2"), "2", starts, now)
+        self.assertNotIn("2", scheduler._match_prefetch_tasks)
+        scheduler.config["image_enabled"] = True
+        scheduler.config["daily_schedule_enabled"] = False
+        scheduler.maybe_start_match_asset_prefetch(self.match("3"), "3", starts, now)
+        self.assertIn("3", scheduler._match_prefetch_tasks)
+        await scheduler._match_prefetch_tasks["3"]
+
+    async def test_failure_retries_after_asset_cooldown(self):
+        scheduler = self.scheduler
+        scheduler.presentation.prefetch_assets = AsyncMock(
+            side_effect=RuntimeError("offline")
+        )
+        now = time.time()
+        starts = now + 70 * 60
+        with self.assertLogs(level="WARNING"):
+            scheduler.maybe_start_match_asset_prefetch(
+                self.match("9"), "9", starts, now
+            )
+            task = scheduler._match_prefetch_tasks["9"]
+            with self.assertRaises(RuntimeError):
+                await task
+            await asyncio.sleep(0)
+        # Retry must clear the 30-minute asset cooldown, not spin at 10 minutes.
+        retry_at = scheduler._match_prefetch_retry_at["9"]
+        self.assertGreaterEqual(retry_at - time.time(), 30 * 60 - 5)
+        # Still cooling down: no new task.
+        scheduler.maybe_start_match_asset_prefetch(self.match("9"), "9", starts, now)
+        self.assertNotIn("9", scheduler._match_prefetch_tasks)
+        # Once the cooldown has passed and the match is still >10min away, retry.
+        scheduler._match_prefetch_retry_at["9"] = time.time() - 1
+        later = starts - 40 * 60
+        with self.assertLogs(level="WARNING"):
+            scheduler.maybe_start_match_asset_prefetch(
+                self.match("9"), "9", starts, later
+            )
+            self.assertIn("9", scheduler._match_prefetch_tasks)
+            with self.assertRaises(RuntimeError):
+                await scheduler._match_prefetch_tasks["9"]
+            await asyncio.sleep(0)
+
+    async def test_reschedule_after_success_rechecks_and_persists(self):
+        scheduler = self.scheduler
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        scheduler.state_file_path = str(Path(temporary.name) / "state.json")
+        scheduler.reminded_match_ids = set()
+        scheduler.tracking_matches = {}
+        scheduler.reported_match_ids = set()
+        scheduler.last_daily_date = None
+        scheduler.last_asset_prefetch_date = None
+        scheduler.event_names = {}
+        scheduler._save_state = lambda: scheduler.__class__._save_state(scheduler)
+
+        now = 1000.0
+        s1 = now + 70 * 60
+        scheduler.maybe_start_match_asset_prefetch(self.match(), "42", s1, now)
+        await scheduler._match_prefetch_tasks["42"]
+        await asyncio.sleep(0)
+        self.assertEqual(scheduler.prefetched_match_starts, {"42": s1})
+
+        # Restart reloads the completed start so the same match is not rechecked.
+        restored = scheduler.__class__.__new__(scheduler.__class__)
+        restored.state_file_path = scheduler.state_file_path
+        restored._load_state()
+        self.assertEqual(restored.prefetched_match_starts, {"42": s1})
+
+        # Reschedule to a different start still inside the window: fresh check.
+        restored.config = dict(scheduler.config)
+        restored.presentation = types.SimpleNamespace(prefetch_assets=AsyncMock())
+        restored._match_prefetch_tasks = {}
+        restored._match_prefetch_retry_at = {}
+        restored._match_prefetch_starts = {}
+        restored.get_tz = Mock(return_value=ZoneInfo("Asia/Shanghai"))
+        restored.get_tracked_event_ids = Mock(return_value=["1"])
+        restored.get_matchday = Mock(return_value="2026-10-03")
+        restored._save_state = lambda: restored.__class__._save_state(restored)
+        s2 = now + 60 * 60
+        restored.maybe_start_match_asset_prefetch(self.match(), "42", s2, now)
+        self.assertIn("42", restored._match_prefetch_tasks)
+        await restored._match_prefetch_tasks["42"]
+        await asyncio.sleep(0)
+        self.assertEqual(restored.prefetched_match_starts["42"], s2)
+
+    async def test_stale_generation_result_does_not_mark_new_start(self):
+        scheduler = self.scheduler
+        old_start = 1000.0 + 70 * 60
+        new_start = 1000.0 + 60 * 60
+        scheduler._match_prefetch_starts["42"] = new_start
+        finished = asyncio.Future()
+        finished.set_result(None)
+        scheduler._on_match_asset_prefetch_done("42", old_start, finished)
+        self.assertNotIn("42", scheduler.prefetched_match_starts)
+
+    def test_prune_keeps_future_and_drops_old(self):
+        scheduler = self.scheduler
+        now = 1_000_000.0
+        scheduler.prefetched_match_starts = {
+            "old": now - 2 * 24 * 3600,
+            "recent": now - 3600,
+            "future": now + 3600,
+        }
+        scheduler._match_prefetch_starts = dict(scheduler.prefetched_match_starts)
+        scheduler._match_prefetch_retry_at = {"old": now, "recent": now, "future": now}
+        scheduler._prune_match_prefetch_state(now)
+        self.assertNotIn("old", scheduler.prefetched_match_starts)
+        self.assertIn("recent", scheduler.prefetched_match_starts)
+        self.assertIn("future", scheduler.prefetched_match_starts)
+        self.assertNotIn("old", scheduler._match_prefetch_retry_at)
+        self.assertIn("future", scheduler._match_prefetch_retry_at)
+
+    async def test_postponement_outside_window_cancels_old_task(self):
+        scheduler = self.scheduler
+        now = time.time()
+        scheduler.maybe_start_match_asset_prefetch(self.match(), "42", now + 4200, now)
+        old_task = scheduler._match_prefetch_tasks["42"]
+        scheduler.maybe_start_match_asset_prefetch(self.match(), "42", now + 86400, now)
+        with self.assertRaises(asyncio.CancelledError):
+            await old_task
+        self.assertNotIn("42", scheduler._match_prefetch_tasks)
+        self.assertNotIn("42", scheduler.prefetched_match_starts)
+        self.assertEqual(scheduler._match_prefetch_starts["42"], now + 86400)
+
+    async def test_old_failure_does_not_delay_rescheduled_match(self):
+        scheduler = self.scheduler
+        scheduler._match_prefetch_starts["42"] = 9000.0
+        old_task = asyncio.Future()
+        old_task.set_exception(RuntimeError("old request failed"))
+        scheduler._on_match_asset_prefetch_done("42", 8000.0, old_task)
+        self.assertNotIn("42", scheduler._match_prefetch_retry_at)
+
+    async def test_daily_prewarm_does_not_suppress_per_match_check(self):
+        scheduler = self.scheduler
+        scheduler.fetch_schedule_matches = AsyncMock(return_value=[self.match()])
+        scheduler.select_schedule_matches = Mock(return_value=[self.match()])
+        await scheduler._prefetch_daily_assets("2026-10-03", self.at(9, 0))
+        # Daily success is not a per-match completion: each match still checks.
+        self.assertEqual(scheduler.prefetched_match_starts, {})
+        now = 1000.0
+        starts = now + 60 * 60
+        scheduler.maybe_start_match_asset_prefetch(self.match(), "42", starts, now)
+        self.assertIn("42", scheduler._match_prefetch_tasks)
+        await scheduler._match_prefetch_tasks["42"]
+
+    @staticmethod
+    def at(hour, minute):
+        return datetime(2026, 10, 3, hour, minute, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    async def test_stop_cancels_match_prefetch(self):
+        scheduler = self.scheduler
+        scheduler._task = None
+        scheduler._running = False
+        scheduler.delivery = types.SimpleNamespace(stop=AsyncMock())
+        scheduler._asset_prefetch_task = None
+        started = asyncio.Event()
+
+        async def slow(match, match_id, starts_ts):
+            started.set()
+            await asyncio.Event().wait()
+
+        scheduler._prefetch_match_assets = slow
+        task = asyncio.create_task(slow({}, "1", 0.0))
+        scheduler._match_prefetch_tasks["1"] = task
+        await started.wait()
+        await scheduler.stop()
+        self.assertTrue(task.cancelled())
+        self.assertEqual(scheduler._match_prefetch_tasks, {})
+
+    async def test_completion_persists_across_restart(self):
+        scheduler = self.scheduler
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        scheduler.state_file_path = str(Path(temporary.name) / "state.json")
+        scheduler.reminded_match_ids = set()
+        scheduler.tracking_matches = {}
+        scheduler.reported_match_ids = set()
+        scheduler.last_daily_date = None
+        scheduler.last_asset_prefetch_date = None
+        scheduler.event_names = {}
+        scheduler.prefetched_match_starts = {"99": 1234.5}
+        scheduler._save_state = lambda: scheduler.__class__._save_state(scheduler)
+        scheduler._save_state()
+        restored = scheduler.__class__.__new__(scheduler.__class__)
+        restored.state_file_path = scheduler.state_file_path
+        restored._load_state()
+        self.assertEqual(restored.prefetched_match_starts, {"99": 1234.5})
 
 
 class DeliveryTests(unittest.IsolatedAsyncioTestCase):

@@ -456,6 +456,43 @@ class PresentationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.service.client.get_team.assert_not_awaited()
 
+    async def test_concurrent_prefetch_passes_share_roster_requests(self):
+        self.service.assets.prefetch = AsyncMock(return_value=True)
+        fetched = []
+
+        async def get_team(team_id):
+            fetched.append(team_id)
+            await asyncio.sleep(0)
+            return {
+                "roster": [
+                    {
+                        "player_id": f"p{team_id}",
+                        "photo": f"https://example.org/{team_id}.png",
+                    }
+                ]
+            }
+
+        self.service.client.get_team = AsyncMock(side_effect=get_team)
+        await asyncio.gather(
+            self.service.prefetch_assets(
+                [match()], pause=0, roster_pause=0, matchday="2026-10-03"
+            ),
+            self.service.prefetch_assets(
+                [match()], pause=0, roster_pause=0, matchday="2026-10-03"
+            ),
+        )
+        # The shared lock must let the second pass reuse the roster cache
+        # instead of refetching the same teams concurrently.
+        self.assertEqual(fetched, ["10", "20"])
+
+    async def test_prefetch_should_run_blocks_after_lock(self):
+        self.service.assets.prefetch = AsyncMock(return_value=True)
+        result = await self.service.prefetch_assets(
+            [match()], pause=0, matchday="2026-10-03", should_run=lambda: False
+        )
+        self.assertIsNone(result)
+        self.service.assets.prefetch.assert_not_awaited()
+
     async def test_disabled_image_does_not_render(self):
         self.service.config["image_enabled"] = False
         self.assertEqual(
