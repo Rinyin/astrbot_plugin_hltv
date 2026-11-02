@@ -64,7 +64,9 @@ class DailyRetryTests(unittest.IsolatedAsyncioTestCase):
         scheduler.delivery = types.SimpleNamespace(jobs={})
         scheduler.client = types.SimpleNamespace(get_upcoming_matches=AsyncMock())
         scheduler.fetch_schedule_matches = scheduler.client.get_upcoming_matches
-        scheduler.select_schedule_matches = lambda matches, now: matches
+        scheduler.select_schedule_matches = Mock(
+            side_effect=lambda matches, now, advance=True: matches
+        )
         scheduler.get_current_matchday = Mock(return_value="2026-10-03")
         scheduler.get_tracked_event_ids = Mock(return_value=["1"])
         scheduler.is_tracked_match = Mock(return_value=True)
@@ -102,6 +104,8 @@ class DailyRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("daily:2026-10-03", scheduler.delivery.jobs)
         await self.check(40)
         self.assertEqual(scheduler.client.get_upcoming_matches.await_count, 3)
+        # The daily push must not advance to later matchdays.
+        self.assertFalse(scheduler.select_schedule_matches.call_args.kwargs["advance"])
 
     async def test_new_day_resets_retry_window(self):
         scheduler = self.scheduler
@@ -160,6 +164,7 @@ class DailyPrefetchTests(unittest.IsolatedAsyncioTestCase):
             scheduler.select_schedule_matches.call_args.args[1],
             self.at(9, 0),
         )
+        self.assertFalse(scheduler.select_schedule_matches.call_args.kwargs["advance"])
         scheduler.maybe_start_asset_prefetch(self.at(8, 30))
         self.assertIsNone(scheduler._asset_prefetch_task)
         self.assertEqual(scheduler.presentation.prefetch_assets.await_count, 1)

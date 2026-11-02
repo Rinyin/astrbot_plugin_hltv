@@ -16,7 +16,7 @@ PLUGIN_NAME = "astrbot_plugin_hltv"
     PLUGIN_NAME,
     "Rinyi",
     "HLTV CS2 关注赛事赛前10分钟提醒、赛后战报获取与每日赛程推送",
-    "1.5.0",
+    "1.5.1",
     "https://github.com/Rinyi/astrbot_plugin_hltv",
 )
 class HLTVPlugin(Star):

@@ -16,6 +16,16 @@ from astrbot.api import logger
 
 from .assets import AssetCache, image_mime
 
+# Rendering budgets (seconds). The remote T2I service renders large pages with
+# embedded fonts/images; concurrent reminders for simultaneous matches can
+# double its latency, so the T2I budget must not be the tight one.
+ENRICH_TIMEOUT = 5
+LOCAL_RENDER_TIMEOUT = 15
+T2I_RENDER_TIMEOUT = 60
+# One page may wait for asset enrichment, a failed local attempt, the T2I call
+# and a render slot; keep headroom so the page timer never cuts T2I short.
+PAGE_BUILD_TIMEOUT = ENRICH_TIMEOUT + LOCAL_RENDER_TIMEOUT + T2I_RENDER_TIMEOUT + 40
+
 
 def value(item, key, precision=None):
     result = item.get(key)
@@ -556,7 +566,9 @@ class PresentationService:
         async with self._render_limit:
             if backend in {"auto", "local"} and time.monotonic() >= self._cooldown:
                 try:
-                    await asyncio.wait_for(self._local(html, output), timeout=15)
+                    await asyncio.wait_for(
+                        self._local(html, output), timeout=LOCAL_RENDER_TIMEOUT
+                    )
                     self._failures = 0
                     return str(output)
                 except Exception:
@@ -573,7 +585,7 @@ class PresentationService:
                             return_url=False,
                             options={"type": "png", "quality": None, "full_page": True},
                         ),
-                        timeout=20,
+                        timeout=T2I_RENDER_TIMEOUT,
                     )
                     if isinstance(rendered, (bytes, bytearray)):
                         content = bytes(rendered)
@@ -627,7 +639,7 @@ class PresentationService:
                 background = results[1]
 
         try:
-            await asyncio.wait_for(enrich(), timeout=5)
+            await asyncio.wait_for(enrich(), timeout=ENRICH_TIMEOUT)
         except TimeoutError:
             logger.debug("[HLTV] 素材准备超时，使用已有素材")
         label = title or {
@@ -703,7 +715,7 @@ class PresentationService:
             )
             self._build_tasks.add(task)
             try:
-                await asyncio.wait_for(task, timeout=40)
+                await asyncio.wait_for(task, timeout=PAGE_BUILD_TIMEOUT)
             except Exception:
                 logger.warning("[HLTV] 图片页面准备失败，使用文本", exc_info=True)
             finally:

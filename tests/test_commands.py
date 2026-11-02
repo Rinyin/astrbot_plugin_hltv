@@ -196,6 +196,58 @@ def test_schedule_uses_each_events_local_day(plugin_class):
     ) == [unknown_live, old_live, berlin, sydney]
 
 
+def test_daily_push_does_not_borrow_future_matchdays(plugin_class):
+    scheduler_class = sys.modules[
+        plugin_class.__module__.rsplit(".", 1)[0] + ".scheduler"
+    ].HLTVScheduler
+    scheduler = scheduler_class.__new__(scheduler_class)
+    scheduler.config = {"tracked_events": ["1", "2"], "timezone": "Asia/Shanghai"}
+    scheduler.is_tracked_match = lambda match: True
+    scheduler.get_match_timezone = lambda match: ZoneInfo(match["zone"])
+    berlin = {
+        "id": 1,
+        "event": {"id": 1},
+        "zone": "Europe/Berlin",
+        "status": "upcoming",
+        "starts_at": "2026-11-02T15:00:00Z",
+    }
+    # New York on Nov 1 evening (Beijing Nov 2 morning): Nov 1 is finished.
+    ny_done = {
+        "id": 2,
+        "event": {"id": 2},
+        "zone": "America/New_York",
+        "status": "finished",
+        "starts_at": "2026-11-01T18:00:00Z",
+    }
+    ny_today = {
+        "id": 3,
+        "event": {"id": 2},
+        "zone": "America/New_York",
+        "status": "upcoming",
+        "starts_at": "2026-11-02T17:00:00Z",
+    }
+    ny_later = {
+        "id": 4,
+        "event": {"id": 2},
+        "zone": "America/New_York",
+        "status": "upcoming",
+        "starts_at": "2026-11-03T17:00:00Z",
+    }
+    matches = [berlin, ny_done, ny_today, ny_later]
+
+    def daily(month, day):
+        now = datetime(2026, month, day, 9, tzinfo=ZoneInfo("Asia/Shanghai"))
+        return scheduler.select_schedule_matches(matches, now, advance=False)
+
+    # Oct 31 / Nov 1 mornings must not announce the Nov 2 matches.
+    assert daily(10, 31) == []
+    assert daily(11, 1) == []
+    assert daily(11, 2) == [berlin, ny_today]
+    # The interactive command still advances to the next matchday.
+    oct31 = datetime(2026, 10, 31, 9, tzinfo=ZoneInfo("Asia/Shanghai"))
+    assert scheduler.select_schedule_matches(matches, oct31) == [berlin, ny_today]
+
+
 @pytest.mark.asyncio
 async def test_collect_keeps_live_without_start_timestamp(plugin):
     live = {"id": 3, "status": "live", "timestamp": None}

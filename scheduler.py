@@ -280,10 +280,21 @@ class HLTVScheduler:
         return combined
 
     def select_schedule_matches(
-        self, matches: List[Dict[str, Any]], now: Optional[datetime] = None
+        self,
+        matches: List[Dict[str, Any]],
+        now: Optional[datetime] = None,
+        advance: bool = True,
     ) -> List[Dict[str, Any]]:
-        """按各赛事当地日期选择赛程，跨日进行中的比赛始终保留。"""
+        """按各赛事当地日期选择赛程，跨日进行中的比赛始终保留。
+
+        advance=True（/hltv today）：当日无待赛时顺延到下一个有比赛的比赛日。
+        advance=False（每日推送）：不向后顺延，只取赛事当地今日至用户今日（含）
+        之间仍有待赛的比赛日，避免数日后的比赛被提前推送。
+        """
         now = now or datetime.now(tz=self.get_tz())
+        user_today = (
+            None if advance else now.astimezone(self.get_tz()).strftime("%Y-%m-%d")
+        )
         events: Dict[str, List[Dict[str, Any]]] = {}
         seen = set()
         for match in matches:
@@ -318,7 +329,15 @@ class HLTVScheduler:
                     future.setdefault(day, []).append(match)
             # Advance each event independently; a live match never disappears
             # when its starting day (or another event's day) has ended.
-            if any(m.get("status") in ("live", "upcoming") for m in current):
+            pending = any(m.get("status") in ("live", "upcoming") for m in current)
+            if not advance:
+                # Daily push: never borrow later matchdays. Western events whose
+                # local date lags the user's date may add the user's today.
+                chosen = list(current) if pending else []
+                for day in sorted(future):
+                    if day <= user_today:
+                        chosen.extend(future[day])
+            elif pending:
                 chosen = current
             elif future:
                 chosen = future[min(future)]
@@ -1155,7 +1174,7 @@ class HLTVScheduler:
     async def _prefetch_daily_assets(self, push_date: str, target: datetime) -> None:
         """后台任务：按推送时刻选择赛程并预热素材（空结果视为失败以便重试）。"""
         matches = await self.fetch_schedule_matches(days=3)
-        selected = self.select_schedule_matches(matches, target)
+        selected = self.select_schedule_matches(matches, target, advance=False)
         if not selected:
             # 网络异常与当天确实无比赛都会返回空，保守重试而不是直接标记完成。
             raise RuntimeError("赛程为空")
@@ -1361,7 +1380,9 @@ class HLTVScheduler:
             )
             # 查询未来比赛并按比赛日聚合
             upcoming = await self.fetch_schedule_matches(days=3)
-            today_major_matches = self.select_schedule_matches(upcoming, now)
+            today_major_matches = self.select_schedule_matches(
+                upcoming, now, advance=False
+            )
 
             if not today_major_matches:
                 logger.info(
