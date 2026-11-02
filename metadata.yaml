@@ -1,5 +1,5 @@
 name: astrbot_plugin_hltv
 desc: HLTV CS2 关注赛事赛前10分钟提醒、赛后战报获取与每日赛程推送（手动标记赛事）
-author: Rinyi
+author: Rinyin
 version: 1.5.1
 repo: https://github.com/Rinyin/astrbot_plugin_hltv
